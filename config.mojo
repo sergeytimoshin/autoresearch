@@ -69,7 +69,7 @@ comptime TOTAL_BATCH_SIZE: Int = 1 << 19  # ~524K
 # Learning rates (per parameter group)
 comptime EMBEDDING_LR: Float64 = 0.6
 comptime UNEMBEDDING_LR: Float64 = 0.004
-comptime MATRIX_LR: Float64 = 0.04
+comptime MATRIX_LR: Float64 = 0.08
 comptime SCALAR_LR: Float64 = 0.5
 
 # AdamW / Muon
