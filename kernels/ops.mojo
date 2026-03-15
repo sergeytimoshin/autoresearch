@@ -23,15 +23,13 @@ from std.memory import stack_allocation
 comptime THREADS_PER_BLOCK: UInt = 256
 
 # Tile sizes for shared-memory matmul.
-# BM x BK tile of X and BN x BK tile of W loaded per iteration.
 # Each thread computes a SUB_M x SUB_N sub-tile of the output.
-# Shared memory: 2 * TILE_K * max(TILE_M, TILE_N) * 4 bytes.
-# TILE_M=TILE_N=32, TILE_K=8, SUB_M=SUB_N=4 -> 2*8*32*4 = 2 KB smem, 64 threads/block.
-comptime TILE_M: Int = 64
-comptime TILE_N: Int = 64
-comptime TILE_K: Int = 16
-comptime SUB_M: Int = 8
-comptime SUB_N: Int = 8
+# Shared memory: 2 * TILE_K * max(TILE_M, TILE_N) * 4 bytes = 2 KB.
+comptime TILE_M: Int = 32
+comptime TILE_N: Int = 32
+comptime TILE_K: Int = 8
+comptime SUB_M: Int = 4
+comptime SUB_N: Int = 4
 comptime MM_THREADS: Int = (TILE_M // SUB_M) * (TILE_N // SUB_N)  # 64
 
 
