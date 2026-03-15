@@ -75,7 +75,7 @@ comptime SCALAR_LR: Float64 = 0.5
 # AdamW / Muon
 comptime ADAM_BETA1: Float64 = 0.8
 comptime ADAM_BETA2: Float64 = 0.95
-comptime WEIGHT_DECAY: Float64 = 0.2
+comptime WEIGHT_DECAY: Float64 = 0.1
 
 # LR schedule
 comptime WARMUP_RATIO: Float64 = 0.0
