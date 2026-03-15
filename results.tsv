@@ -1,7 +1,14 @@
 commit	val_bpb	status	description
 282adf5	2.390422	keep	baseline: depth=8 C=512 B=4 T=512
-3492bcd	2.190782	keep	depth=4 (C=256 2heads): 3.3x more steps
-9c31b6e	2.302352	discard	depth=6: slower than depth=4, worse bpb
-1c80050	2.191871	discard	B=8 depth=4: same tokens, fewer steps, marginally worse
-3d3ff69	2.170718	keep	depth=3 same C=256: 198 steps, new best
-8950aef	2.079178	keep	depth=2 C=128: 514 steps 1M tokens, big improvement
+3492bcd	2.190782	keep	depth=4 C=256: 3.3x more steps
+3d3ff69	2.170718	keep	depth=3 C=256: 198 steps
+8950aef	2.079178	keep	depth=2 C=128: 514 steps 1M tokens
+ca32af0	2.037592	keep	depth=1 C=128: 987 steps 2M tokens
+50ce5f1	1.988682	keep	bf16+warp-attn+grad-accum
+e0f2fd6	1.940150	keep	accum=16 sweet spot
+e28c324	1.937653	keep	PE=2 optimizer speedup
+55953f4	1.900399	keep	MATRIX_LR=0.08 B=32 accum=2
+bc18834	1.890161	keep	NorMuon+PE=5+T=1024
+7af8d38	1.885956	keep	T=2048 B=4 accum=4
+77b5950	1.884469	keep	WEIGHT_DECAY=0.05
+00651fe	1.884095	keep	no VE for depth=1
