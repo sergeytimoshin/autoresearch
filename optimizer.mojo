@@ -332,7 +332,7 @@ struct MuonState:
         )
 
         var tall = nrows >= ncols
-        for pe_iter in range(3):
+        for pe_iter in range(2):
             var ca = Float32(POLAR_COEFF_A(pe_iter))
             var cb = Float32(POLAR_COEFF_B(pe_iter))
             var cc = Float32(POLAR_COEFF_C(pe_iter))
