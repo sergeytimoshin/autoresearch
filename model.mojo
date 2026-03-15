@@ -20,7 +20,7 @@ from kernels.ops import (
     rmsnorm_fwd,
     linear_fwd, TILE_M, TILE_N, TILE_K, MM_THREADS,
     rope_fwd,
-    flash_attn_fwd,
+    flash_attn_fwd, FA_WARPS, FA_THREADS,
     flash_attn_bwd_precompute_d,
     flash_attn_bwd_dq,
     flash_attn_bwd_dkv,
@@ -30,7 +30,7 @@ from kernels.ops import (
     ve_apply_fwd,
     ve_apply_bwd,
     ve_gate_bwd,
-    add_residual_fwd,
+    add_residual_fwd, add_residual_fwd_f32,
     scaled_add_fwd,
     cross_entropy_fwd,
     mean_reduce,
@@ -84,7 +84,7 @@ fn precompute_rope(
 
 
 def fill_normal_kernel(
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     seed_base: UInt64,
     std: Float32,
     size: Int,
@@ -112,11 +112,11 @@ def fill_normal_kernel(
     from std.math import sqrt, log, cos
     var PI: Float32 = 3.14159265358979323846
     var z = sqrt(-2.0 * log(u1)) * cos(2.0 * PI * u2)
-    output[tid] = z * std
+    output[tid] = BFloat16(z * std)
 
 
 def fill_uniform_kernel(
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     seed_base: UInt64,
     low: Float32,
     high: Float32,
@@ -131,18 +131,18 @@ def fill_uniform_kernel(
     state ^= state << 25
     state ^= state >> 27
     var u = Float32(state & 0xFFFFFF) / Float32(0x1000000)
-    output[tid] = low + u * (high - low)
+    output[tid] = BFloat16(low + u * (high - low))
 
 
 def fill_zeros_kernel(
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     size: Int,
 ):
     """Fill buffer with zeros."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-    output[tid] = 0.0
+    output[tid] = BFloat16(0.0)
 
 
 def fill_value_kernel(
@@ -161,9 +161,9 @@ def fill_value_kernel(
 
 fn launch_linear(
     ctx: DeviceContext,
-    output: DeviceBuffer[DType.float32],
-    input: DeviceBuffer[DType.float32],
-    weight: DeviceBuffer[DType.float32],
+    output: DeviceBuffer[DType.bfloat16],
+    input: DeviceBuffer[DType.bfloat16],
+    weight: DeviceBuffer[DType.bfloat16],
     M: Int, N: Int, K: Int,
 ) raises:
     """Launch tiled matmul: Y[m,n] = sum_k X[m,k] * W[n,k]."""
@@ -178,7 +178,7 @@ fn launch_linear_bwd_dx(
     ctx: DeviceContext,
     grad_input: DeviceBuffer[DType.float32],
     grad_output: DeviceBuffer[DType.float32],
-    weight: DeviceBuffer[DType.float32],
+    weight: DeviceBuffer[DType.bfloat16],
     M: Int, N: Int, K: Int,
 ) raises:
     """Launch tiled NN matmul: dX[m,k] = sum_n dY[m,n] * W[n,k]."""
@@ -193,7 +193,7 @@ fn launch_linear_bwd_dw(
     ctx: DeviceContext,
     grad_weight: DeviceBuffer[DType.float32],
     grad_output: DeviceBuffer[DType.float32],
-    input: DeviceBuffer[DType.float32],
+    input: DeviceBuffer[DType.bfloat16],
     M: Int, N: Int, K: Int,
 ) raises:
     """Launch tiled TN matmul: dW[n,k] += sum_m dY[m,n] * X[m,k]."""
@@ -207,7 +207,7 @@ fn launch_linear_bwd_dw(
 
 
 struct ModelWeights:
-    """All model parameters stored as flat GPU buffers (float32).
+    """All model parameters stored as flat GPU buffers (bfloat16 weights, float32 gradients).
 
     Layout matches train.py's GPT model:
     - wte: [vocab_size, n_embd] -- token embeddings
@@ -223,23 +223,23 @@ struct ModelWeights:
     var config: GPTConfig
 
     # Embeddings
-    var wte: DeviceBuffer[DType.float32]
-    var lm_head: DeviceBuffer[DType.float32]
+    var wte: DeviceBuffer[DType.bfloat16]
+    var lm_head: DeviceBuffer[DType.bfloat16]
 
     # Per-layer scalars
     var resid_lambdas: DeviceBuffer[DType.float32]
     var x0_lambdas: DeviceBuffer[DType.float32]
 
     # Per-block linear weights (stored as List of buffers)
-    var c_q: List[DeviceBuffer[DType.float32]]
-    var c_k: List[DeviceBuffer[DType.float32]]
-    var c_v: List[DeviceBuffer[DType.float32]]
-    var c_proj: List[DeviceBuffer[DType.float32]]
-    var c_fc: List[DeviceBuffer[DType.float32]]
-    var mlp_proj: List[DeviceBuffer[DType.float32]]
+    var c_q: List[DeviceBuffer[DType.bfloat16]]
+    var c_k: List[DeviceBuffer[DType.bfloat16]]
+    var c_v: List[DeviceBuffer[DType.bfloat16]]
+    var c_proj: List[DeviceBuffer[DType.bfloat16]]
+    var c_fc: List[DeviceBuffer[DType.bfloat16]]
+    var mlp_proj: List[DeviceBuffer[DType.bfloat16]]
 
     # Value embeddings and gates (only for layers with has_ve)
-    var value_embeds: List[DeviceBuffer[DType.float32]]
+    var value_embeds: List[DeviceBuffer[DType.bfloat16]]
     var ve_gate: List[DeviceBuffer[DType.float32]]
 
     # RoPE buffers
@@ -271,36 +271,36 @@ struct ModelWeights:
         var half_dim = config.head_dim // 2
 
         # Embeddings
-        self.wte = ctx.enqueue_create_buffer[DType.float32](V * C)
-        self.lm_head = ctx.enqueue_create_buffer[DType.float32](V * C)
+        self.wte = ctx.enqueue_create_buffer[DType.bfloat16](V * C)
+        self.lm_head = ctx.enqueue_create_buffer[DType.bfloat16](V * C)
 
         # Scalars
         self.resid_lambdas = ctx.enqueue_create_buffer[DType.float32](L)
         self.x0_lambdas = ctx.enqueue_create_buffer[DType.float32](L)
 
         # Per-block weights
-        self.c_q = List[DeviceBuffer[DType.float32]]()
-        self.c_k = List[DeviceBuffer[DType.float32]]()
-        self.c_v = List[DeviceBuffer[DType.float32]]()
-        self.c_proj = List[DeviceBuffer[DType.float32]]()
-        self.c_fc = List[DeviceBuffer[DType.float32]]()
-        self.mlp_proj = List[DeviceBuffer[DType.float32]]()
-        self.value_embeds = List[DeviceBuffer[DType.float32]]()
+        self.c_q = List[DeviceBuffer[DType.bfloat16]]()
+        self.c_k = List[DeviceBuffer[DType.bfloat16]]()
+        self.c_v = List[DeviceBuffer[DType.bfloat16]]()
+        self.c_proj = List[DeviceBuffer[DType.bfloat16]]()
+        self.c_fc = List[DeviceBuffer[DType.bfloat16]]()
+        self.mlp_proj = List[DeviceBuffer[DType.bfloat16]]()
+        self.value_embeds = List[DeviceBuffer[DType.bfloat16]]()
         self.ve_gate = List[DeviceBuffer[DType.float32]]()
 
         for i in range(L):
-            self.c_q.append(ctx.enqueue_create_buffer[DType.float32](C * C))
-            self.c_k.append(ctx.enqueue_create_buffer[DType.float32](kv_dim * C))
-            self.c_v.append(ctx.enqueue_create_buffer[DType.float32](kv_dim * C))
-            self.c_proj.append(ctx.enqueue_create_buffer[DType.float32](C * C))
-            self.c_fc.append(ctx.enqueue_create_buffer[DType.float32](mlp_dim * C))
-            self.mlp_proj.append(ctx.enqueue_create_buffer[DType.float32](C * mlp_dim))
+            self.c_q.append(ctx.enqueue_create_buffer[DType.bfloat16](C * C))
+            self.c_k.append(ctx.enqueue_create_buffer[DType.bfloat16](kv_dim * C))
+            self.c_v.append(ctx.enqueue_create_buffer[DType.bfloat16](kv_dim * C))
+            self.c_proj.append(ctx.enqueue_create_buffer[DType.bfloat16](C * C))
+            self.c_fc.append(ctx.enqueue_create_buffer[DType.bfloat16](mlp_dim * C))
+            self.mlp_proj.append(ctx.enqueue_create_buffer[DType.bfloat16](C * mlp_dim))
             if config.has_ve(i):
-                self.value_embeds.append(ctx.enqueue_create_buffer[DType.float32](V * kv_dim))
+                self.value_embeds.append(ctx.enqueue_create_buffer[DType.bfloat16](V * kv_dim))
                 self.ve_gate.append(ctx.enqueue_create_buffer[DType.float32](config.n_kv_head * VE_GATE_CHANNELS))
             else:
                 # Placeholder (1 element) for layers without VE
-                self.value_embeds.append(ctx.enqueue_create_buffer[DType.float32](1))
+                self.value_embeds.append(ctx.enqueue_create_buffer[DType.bfloat16](1))
                 self.ve_gate.append(ctx.enqueue_create_buffer[DType.float32](1))
 
         # RoPE
@@ -415,9 +415,9 @@ struct ModelWeights:
                 )
                 seed += 1
 
-                # ve_gate: zeros
-                ctx.enqueue_function[fill_zeros_kernel, fill_zeros_kernel](
-                    self.ve_gate[i], self.config.n_kv_head * VE_GATE_CHANNELS,
+                # ve_gate: zeros (float32, use fill_value_kernel)
+                ctx.enqueue_function[fill_value_kernel, fill_value_kernel](
+                    self.ve_gate[i], Float32(0.0), self.config.n_kv_head * VE_GATE_CHANNELS,
                     grid_dim=1, block_dim=LAUNCH_BLOCK,
                 )
 
@@ -432,44 +432,44 @@ struct ModelWeights:
 struct ForwardBuffers:
     """Pre-allocated activation buffers for the forward pass.
 
-    All buffers are flat float32 arrays.
+    Activation buffers are bfloat16; gradient and scalar buffers are float32.
     """
 
     # Scratch buffers
-    var x: DeviceBuffer[DType.float32]             # [B*T, C] current hidden state
-    var x0: DeviceBuffer[DType.float32]            # [B*T, C] initial embedding (for skip connections)
-    var x_norm: DeviceBuffer[DType.float32]        # [B*T, C] normalized hidden state
+    var x: DeviceBuffer[DType.bfloat16]            # [B*T, C] current hidden state
+    var x0: DeviceBuffer[DType.bfloat16]           # [B*T, C] initial embedding (for skip connections)
+    var x_norm: DeviceBuffer[DType.bfloat16]       # [B*T, C] normalized hidden state
     var rms: DeviceBuffer[DType.float32]           # [B*T] saved RMS values
-    var q: DeviceBuffer[DType.float32]             # [B*T, C] query projections
-    var k: DeviceBuffer[DType.float32]             # [B*T, kv_dim] key projections
-    var v: DeviceBuffer[DType.float32]             # [B*T, kv_dim] value projections
+    var q: DeviceBuffer[DType.bfloat16]            # [B*T, C] query projections
+    var k: DeviceBuffer[DType.bfloat16]            # [B*T, kv_dim] key projections
+    var v: DeviceBuffer[DType.bfloat16]            # [B*T, kv_dim] value projections
     var lse: DeviceBuffer[DType.float32]           # [B*T*n_head] log-sum-exp from flash attn
     var d_buf: DeviceBuffer[DType.float32]         # [B*T*n_head] dot(O, dO) for flash attn bwd
-    var attn_out: DeviceBuffer[DType.float32]      # [B*T*n_head, head_dim] attention output
-    var proj_out: DeviceBuffer[DType.float32]      # [B*T, C] after c_proj
-    var mlp_hidden: DeviceBuffer[DType.float32]    # [B*T, 4*C] MLP hidden
-    var mlp_act: DeviceBuffer[DType.float32]       # [B*T, 4*C] after relu squared
-    var mlp_out: DeviceBuffer[DType.float32]       # [B*T, C] MLP output
-    var logits: DeviceBuffer[DType.float32]        # [B*T, V] logits
+    var attn_out: DeviceBuffer[DType.bfloat16]     # [B*T*n_head, head_dim] attention output
+    var proj_out: DeviceBuffer[DType.bfloat16]     # [B*T, C] after c_proj
+    var mlp_hidden: DeviceBuffer[DType.bfloat16]   # [B*T, 4*C] MLP hidden
+    var mlp_act: DeviceBuffer[DType.bfloat16]      # [B*T, 4*C] after relu squared
+    var mlp_out: DeviceBuffer[DType.bfloat16]      # [B*T, C] MLP output
+    var logits: DeviceBuffer[DType.bfloat16]       # [B*T, V] logits
     var loss: DeviceBuffer[DType.float32]          # [B*T] per-token loss
     var mean_loss: DeviceBuffer[DType.float32]     # [1] mean loss
 
     # Per-layer saved activations
-    var saved_x: List[DeviceBuffer[DType.float32]]             # x before each block
-    var saved_x_norm_attn: List[DeviceBuffer[DType.float32]]   # x_norm before attn
-    var saved_q: List[DeviceBuffer[DType.float32]]             # q after RoPE+norm
-    var saved_k: List[DeviceBuffer[DType.float32]]             # k after RoPE+norm
-    var saved_v: List[DeviceBuffer[DType.float32]]             # v
+    var saved_x: List[DeviceBuffer[DType.bfloat16]]            # x before each block
+    var saved_x_norm_attn: List[DeviceBuffer[DType.bfloat16]]  # x_norm before attn
+    var saved_q: List[DeviceBuffer[DType.bfloat16]]            # q after RoPE+norm
+    var saved_k: List[DeviceBuffer[DType.bfloat16]]            # k after RoPE+norm
+    var saved_v: List[DeviceBuffer[DType.bfloat16]]            # v
     var saved_lse: List[DeviceBuffer[DType.float32]]           # lse from flash attn
-    var saved_attn_out: List[DeviceBuffer[DType.float32]]      # attention output
-    var saved_x_norm_mlp: List[DeviceBuffer[DType.float32]]    # x_norm before MLP
-    var saved_mlp_hidden: List[DeviceBuffer[DType.float32]]    # before relu squared
-    var saved_mlp_act: List[DeviceBuffer[DType.float32]]       # after relu squared
+    var saved_attn_out: List[DeviceBuffer[DType.bfloat16]]     # attention output
+    var saved_x_norm_mlp: List[DeviceBuffer[DType.bfloat16]]   # x_norm before MLP
+    var saved_mlp_hidden: List[DeviceBuffer[DType.bfloat16]]   # before relu squared
+    var saved_mlp_act: List[DeviceBuffer[DType.bfloat16]]      # after relu squared
     var saved_rms_attn: List[DeviceBuffer[DType.float32]]      # RMS for attn norm
     var saved_rms_mlp: List[DeviceBuffer[DType.float32]]       # RMS for MLP norm
-    var saved_x_pre_final: DeviceBuffer[DType.float32]         # x before final norm
+    var saved_x_pre_final: DeviceBuffer[DType.bfloat16]        # x before final norm
     var saved_rms_final: DeviceBuffer[DType.float32]           # RMS for final norm
-    var saved_x_final: DeviceBuffer[DType.float32]             # x after final norm (for lm_head bwd)
+    var saved_x_final: DeviceBuffer[DType.bfloat16]            # x after final norm (for lm_head bwd)
 
     # Gradient scratch
     var grad_x: DeviceBuffer[DType.float32]            # [B*T, C] gradient of x
@@ -485,12 +485,12 @@ struct ForwardBuffers:
     var grad_mlp_hidden: DeviceBuffer[DType.float32]   # [B*T, 4*C]
 
     # VE scratch
-    var ve_buf: DeviceBuffer[DType.float32]            # [B*T, kv_dim] value embedding lookup
-    var ve_gate_buf: DeviceBuffer[DType.float32]       # [B*T, n_kv_head] gate values
+    var ve_buf: DeviceBuffer[DType.bfloat16]           # [B*T, kv_dim] value embedding lookup
+    var ve_gate_buf: DeviceBuffer[DType.bfloat16]      # [B*T, n_kv_head] gate values
     var grad_gate: DeviceBuffer[DType.float32]         # [B*T, n_kv_head] gate gradient scratch
     var grad_ve: DeviceBuffer[DType.float32]           # [B*T, kv_dim] VE gradient scratch
-    var saved_ve: List[DeviceBuffer[DType.float32]]    # per-layer saved VE lookup
-    var saved_gate: List[DeviceBuffer[DType.float32]]  # per-layer saved gate values
+    var saved_ve: List[DeviceBuffer[DType.bfloat16]]   # per-layer saved VE lookup
+    var saved_gate: List[DeviceBuffer[DType.bfloat16]] # per-layer saved gate values
 
     fn __init__(out self, ctx: DeviceContext, B: Int, T: Int, config: GPTConfig) raises:
         var BT = B * T
@@ -499,54 +499,54 @@ struct ForwardBuffers:
         var kv_dim = config.kv_dim
         var mlp_dim = MLP_EXPANSION * C
 
-        self.x = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.x0 = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.x_norm = ctx.enqueue_create_buffer[DType.float32](BT * C)
+        self.x = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.x0 = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.x_norm = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
         self.rms = ctx.enqueue_create_buffer[DType.float32](BT)
-        self.q = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.k = ctx.enqueue_create_buffer[DType.float32](BT * kv_dim)
-        self.v = ctx.enqueue_create_buffer[DType.float32](BT * kv_dim)
+        self.q = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.k = ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim)
+        self.v = ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim)
         var n_head = config.n_head
         self.lse = ctx.enqueue_create_buffer[DType.float32](BT * n_head)
         self.d_buf = ctx.enqueue_create_buffer[DType.float32](BT * n_head)
-        self.attn_out = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.proj_out = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.mlp_hidden = ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim)
-        self.mlp_act = ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim)
-        self.mlp_out = ctx.enqueue_create_buffer[DType.float32](BT * C)
-        self.logits = ctx.enqueue_create_buffer[DType.float32](BT * V)
+        self.attn_out = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.proj_out = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.mlp_hidden = ctx.enqueue_create_buffer[DType.bfloat16](BT * mlp_dim)
+        self.mlp_act = ctx.enqueue_create_buffer[DType.bfloat16](BT * mlp_dim)
+        self.mlp_out = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
+        self.logits = ctx.enqueue_create_buffer[DType.bfloat16](BT * V)
         self.loss = ctx.enqueue_create_buffer[DType.float32](BT)
         self.mean_loss = ctx.enqueue_create_buffer[DType.float32](1)
 
         var L = config.n_layer
-        self.saved_x = List[DeviceBuffer[DType.float32]]()
-        self.saved_x_norm_attn = List[DeviceBuffer[DType.float32]]()
-        self.saved_q = List[DeviceBuffer[DType.float32]]()
-        self.saved_k = List[DeviceBuffer[DType.float32]]()
-        self.saved_v = List[DeviceBuffer[DType.float32]]()
+        self.saved_x = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_x_norm_attn = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_q = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_k = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_v = List[DeviceBuffer[DType.bfloat16]]()
         self.saved_lse = List[DeviceBuffer[DType.float32]]()
-        self.saved_attn_out = List[DeviceBuffer[DType.float32]]()
-        self.saved_x_norm_mlp = List[DeviceBuffer[DType.float32]]()
-        self.saved_mlp_hidden = List[DeviceBuffer[DType.float32]]()
-        self.saved_mlp_act = List[DeviceBuffer[DType.float32]]()
+        self.saved_attn_out = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_x_norm_mlp = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_mlp_hidden = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_mlp_act = List[DeviceBuffer[DType.bfloat16]]()
         self.saved_rms_attn = List[DeviceBuffer[DType.float32]]()
         self.saved_rms_mlp = List[DeviceBuffer[DType.float32]]()
         for _ in range(L):
-            self.saved_x.append(ctx.enqueue_create_buffer[DType.float32](BT * C))
-            self.saved_x_norm_attn.append(ctx.enqueue_create_buffer[DType.float32](BT * C))
-            self.saved_q.append(ctx.enqueue_create_buffer[DType.float32](BT * C))
-            self.saved_k.append(ctx.enqueue_create_buffer[DType.float32](BT * kv_dim))
-            self.saved_v.append(ctx.enqueue_create_buffer[DType.float32](BT * kv_dim))
+            self.saved_x.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * C))
+            self.saved_x_norm_attn.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * C))
+            self.saved_q.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * C))
+            self.saved_k.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim))
+            self.saved_v.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim))
             self.saved_lse.append(ctx.enqueue_create_buffer[DType.float32](BT * n_head))
-            self.saved_attn_out.append(ctx.enqueue_create_buffer[DType.float32](BT * C))
-            self.saved_x_norm_mlp.append(ctx.enqueue_create_buffer[DType.float32](BT * C))
-            self.saved_mlp_hidden.append(ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim))
-            self.saved_mlp_act.append(ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim))
+            self.saved_attn_out.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * C))
+            self.saved_x_norm_mlp.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * C))
+            self.saved_mlp_hidden.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * mlp_dim))
+            self.saved_mlp_act.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * mlp_dim))
             self.saved_rms_attn.append(ctx.enqueue_create_buffer[DType.float32](BT))
             self.saved_rms_mlp.append(ctx.enqueue_create_buffer[DType.float32](BT))
-        self.saved_x_pre_final = ctx.enqueue_create_buffer[DType.float32](BT * C)
+        self.saved_x_pre_final = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
         self.saved_rms_final = ctx.enqueue_create_buffer[DType.float32](BT)
-        self.saved_x_final = ctx.enqueue_create_buffer[DType.float32](BT * C)
+        self.saved_x_final = ctx.enqueue_create_buffer[DType.bfloat16](BT * C)
 
         self.grad_x = ctx.enqueue_create_buffer[DType.float32](BT * C)
         self.grad_x0 = ctx.enqueue_create_buffer[DType.float32](BT * C)
@@ -560,15 +560,15 @@ struct ForwardBuffers:
         self.grad_mlp_act = ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim)
         self.grad_mlp_hidden = ctx.enqueue_create_buffer[DType.float32](BT * mlp_dim)
 
-        self.ve_buf = ctx.enqueue_create_buffer[DType.float32](BT * kv_dim)
-        self.ve_gate_buf = ctx.enqueue_create_buffer[DType.float32](BT * n_head)
+        self.ve_buf = ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim)
+        self.ve_gate_buf = ctx.enqueue_create_buffer[DType.bfloat16](BT * n_head)
         self.grad_gate = ctx.enqueue_create_buffer[DType.float32](BT * n_head)
         self.grad_ve = ctx.enqueue_create_buffer[DType.float32](BT * kv_dim)
-        self.saved_ve = List[DeviceBuffer[DType.float32]]()
-        self.saved_gate = List[DeviceBuffer[DType.float32]]()
+        self.saved_ve = List[DeviceBuffer[DType.bfloat16]]()
+        self.saved_gate = List[DeviceBuffer[DType.bfloat16]]()
         for _ in range(L):
-            self.saved_ve.append(ctx.enqueue_create_buffer[DType.float32](BT * kv_dim))
-            self.saved_gate.append(ctx.enqueue_create_buffer[DType.float32](BT * n_head))
+            self.saved_ve.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * kv_dim))
+            self.saved_gate.append(ctx.enqueue_create_buffer[DType.bfloat16](BT * n_head))
 
 # ── Forward Pass ─────────────────────────────────────────────────────────
 
@@ -695,7 +695,7 @@ fn forward(
         ctx.enqueue_function[flash_attn_fwd, flash_attn_fwd](
             bufs.attn_out, bufs.lse, bufs.q, bufs.k, bufs.v,
             B, T, n_head, head_dim, ws,
-            grid_dim=ceildiv(bth_total, BLK), block_dim=BLK,
+            grid_dim=ceildiv(bth_total, FA_WARPS), block_dim=FA_THREADS,
         )
         ctx.enqueue_copy(dst_buf=bufs.saved_lse[layer_idx], src_buf=bufs.lse)
         ctx.enqueue_copy(dst_buf=bufs.saved_attn_out[layer_idx], src_buf=bufs.attn_out)
@@ -894,7 +894,7 @@ fn backward(
             bufs.saved_rms_mlp[layer_idx], BT, C,
             grid_dim=BT, block_dim=BLK,
         )
-        ctx.enqueue_function[add_residual_fwd, add_residual_fwd](
+        ctx.enqueue_function[add_residual_fwd_f32, add_residual_fwd_f32](
             bufs.grad_x, bufs.grad_x, bufs.grad_x_norm, BT * C,
             grid_dim=ceildiv(BT * C, BLK), block_dim=BLK,
         )
@@ -908,30 +908,29 @@ fn backward(
 
         # 5g. Flash Attention backward (recomputes attention, O(T) memory)
         var bth_total = B * T * n_head
-        var bthd_total = bth_total * head_dim
         var ws = config.window_size(layer_idx)
 
         # Step 0: D[bth] = sum_d O[bth,d] * dO[bth,d]
         ctx.enqueue_function[flash_attn_bwd_precompute_d, flash_attn_bwd_precompute_d](
             bufs.d_buf, bufs.saved_attn_out[layer_idx], bufs.grad_attn_out,
             B, T, n_head, head_dim,
-            grid_dim=ceildiv(bth_total, BLK), block_dim=BLK,
+            grid_dim=ceildiv(bth_total, FA_WARPS), block_dim=FA_THREADS,
         )
-        # Step 1: dQ
+        # Step 1: dQ (one warp per query)
         ctx.enqueue_function[flash_attn_bwd_dq, flash_attn_bwd_dq](
             bufs.grad_q,
             bufs.saved_q[layer_idx], bufs.saved_k[layer_idx], bufs.saved_v[layer_idx],
             bufs.grad_attn_out, bufs.saved_lse[layer_idx], bufs.d_buf,
             B, T, n_head, head_dim, ws,
-            grid_dim=ceildiv(bthd_total, BLK), block_dim=BLK,
+            grid_dim=ceildiv(bth_total, FA_WARPS), block_dim=FA_THREADS,
         )
-        # Step 2: dK + dV
+        # Step 2: dK + dV (one warp per key)
         ctx.enqueue_function[flash_attn_bwd_dkv, flash_attn_bwd_dkv](
             bufs.grad_k, bufs.grad_v,
             bufs.saved_q[layer_idx], bufs.saved_k[layer_idx], bufs.saved_v[layer_idx],
             bufs.grad_attn_out, bufs.saved_lse[layer_idx], bufs.d_buf,
             B, T, n_head, head_dim, ws,
-            grid_dim=ceildiv(bthd_total, BLK), block_dim=BLK,
+            grid_dim=ceildiv(bth_total, FA_WARPS), block_dim=FA_THREADS,
         )
 
         # 5f. Q/K RMSNorm backward -- skipped (norm is parameter-free, gradient passes through)
@@ -969,7 +968,7 @@ fn backward(
 
         # Add K contribution to grad_x_norm (reuse grad_mlp_out as scratch)
         launch_linear_bwd_dx(ctx, bufs.grad_mlp_out, bufs.grad_k, weights.c_k[layer_idx], BT, kv_dim, C)
-        ctx.enqueue_function[add_residual_fwd, add_residual_fwd](
+        ctx.enqueue_function[add_residual_fwd_f32, add_residual_fwd_f32](
             bufs.grad_x_norm, bufs.grad_x_norm, bufs.grad_mlp_out, BT * C,
             grid_dim=ceildiv(BT * C, BLK), block_dim=BLK,
         )
@@ -977,7 +976,7 @@ fn backward(
 
         # Add V contribution to grad_x_norm
         launch_linear_bwd_dx(ctx, bufs.grad_mlp_out, bufs.grad_v, weights.c_v[layer_idx], BT, kv_dim, C)
-        ctx.enqueue_function[add_residual_fwd, add_residual_fwd](
+        ctx.enqueue_function[add_residual_fwd_f32, add_residual_fwd_f32](
             bufs.grad_x_norm, bufs.grad_x_norm, bufs.grad_mlp_out, BT * C,
             grid_dim=ceildiv(BT * C, BLK), block_dim=BLK,
         )
@@ -1000,7 +999,7 @@ fn backward(
             bufs.saved_rms_attn[layer_idx], BT, C,
             grid_dim=BT, block_dim=BLK,
         )
-        ctx.enqueue_function[add_residual_fwd, add_residual_fwd](
+        ctx.enqueue_function[add_residual_fwd_f32, add_residual_fwd_f32](
             bufs.grad_x, bufs.grad_x, bufs.grad_x_norm, BT * C,
             grid_dim=ceildiv(BT * C, BLK), block_dim=BLK,
         )

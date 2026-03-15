@@ -14,7 +14,7 @@ from std.os.atomic import Atomic, Consistency
 from std.sys.info import is_apple_gpu
 
 from kernels.ops import (
-    linear_fwd, linear_bwd_dx, linear_bwd_dw,
+    linear_fwd_f32, linear_bwd_dx_f32, linear_bwd_dw_f32,
     TILE_M, TILE_N, TILE_K, MM_THREADS,
 )
 from config import POLAR_COEFF_A, POLAR_COEFF_B, POLAR_COEFF_C
@@ -25,6 +25,39 @@ comptime BLOCK: Int = 256
 # ── AdamW GPU kernel ─────────────────────────────────────────────────────────
 
 def adamw_kernel(
+    params: UnsafePointer[BFloat16, MutAnyOrigin],
+    grads: UnsafePointer[Float32, MutAnyOrigin],
+    exp_avg: UnsafePointer[Float32, MutAnyOrigin],
+    exp_avg_sq: UnsafePointer[Float32, MutAnyOrigin],
+    lr: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    eps: Float32,
+    weight_decay: Float32,
+    bias_corr1: Float32,
+    bias_corr2: Float32,
+    size: Int,
+):
+    """AdamW step. Params bf16, grads/moments f32. Bias correction pre-computed on CPU."""
+    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if tid >= size:
+        return
+
+    var p = Float32(params[tid])
+    var g = grads[tid]
+
+    p = p * (1.0 - lr * weight_decay)
+
+    var m = beta1 * exp_avg[tid] + (1.0 - beta1) * g
+    exp_avg[tid] = m
+
+    var v = beta2 * exp_avg_sq[tid] + (1.0 - beta2) * g * g
+    exp_avg_sq[tid] = v
+
+    params[tid] = BFloat16(p - lr * (m / bias_corr1) / (sqrt(v / bias_corr2) + eps))
+
+
+def adamw_kernel_f32(
     params: UnsafePointer[Float32, MutAnyOrigin],
     grads: UnsafePointer[Float32, MutAnyOrigin],
     exp_avg: UnsafePointer[Float32, MutAnyOrigin],
@@ -38,22 +71,17 @@ def adamw_kernel(
     bias_corr2: Float32,
     size: Int,
 ):
-    """AdamW step. Bias correction pre-computed on CPU."""
+    """AdamW step for float32 params (scalar parameters like resid_lambdas)."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-
     var p = params[tid]
     var g = grads[tid]
-
     p = p * (1.0 - lr * weight_decay)
-
     var m = beta1 * exp_avg[tid] + (1.0 - beta1) * g
     exp_avg[tid] = m
-
     var v = beta2 * exp_avg_sq[tid] + (1.0 - beta2) * g * g
     exp_avg_sq[tid] = v
-
     params[tid] = p - lr * (m / bias_corr1) / (sqrt(v / bias_corr2) + eps)
 
 
@@ -100,9 +128,33 @@ struct AdamWState:
         self.eps.append(eps)
         self.weight_decays.append(weight_decay)
 
-    fn step_group(
+    fn step_group_f32(
         self, ctx: DeviceContext, group_idx: Int,
         params: DeviceBuffer[DType.float32], grads: DeviceBuffer[DType.float32],
+        lr_multiplier: Float64,
+    ) raises:
+        """AdamW step for float32 params (scalar parameters)."""
+        var size = self.sizes[group_idx]
+        var lr = Float32(self.lrs[group_idx] * lr_multiplier)
+        var b1 = Float32(self.betas1[group_idx])
+        var b2 = Float32(self.betas2[group_idx])
+        var bc1: Float32 = 1.0
+        var bc2: Float32 = 1.0
+        for _ in range(self.step):
+            bc1 *= b1
+            bc2 *= b2
+        ctx.enqueue_function[adamw_kernel_f32, adamw_kernel_f32](
+            params, grads,
+            self.exp_avg[group_idx], self.exp_avg_sq[group_idx],
+            lr, b1, b2, Float32(self.eps[group_idx]),
+            Float32(self.weight_decays[group_idx]),
+            1.0 - bc1, 1.0 - bc2, size,
+            grid_dim=ceildiv(size, BLOCK), block_dim=BLOCK,
+        )
+
+    fn step_group(
+        self, ctx: DeviceContext, group_idx: Int,
+        params: DeviceBuffer[DType.bfloat16], grads: DeviceBuffer[DType.float32],
         lr_multiplier: Float64,
     ) raises:
         var size = self.sizes[group_idx]
@@ -195,19 +247,19 @@ def scale_add_kernel(
 
 
 def muon_update_kernel(
-    params: UnsafePointer[Float32, MutAnyOrigin],
+    params: UnsafePointer[BFloat16, MutAnyOrigin],
     grads: UnsafePointer[Float32, MutAnyOrigin],
     lr: Float32, wd: Float32,
     size: Int,
 ):
-    """Cautious update: decay only when gradient and param have same sign."""
+    """Cautious update: params bf16, grads f32. Decay only when gradient and param have same sign."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-    var p = params[tid]
+    var p = Float32(params[tid])
     var g = grads[tid]
     var decay = wd * p if (g * p) >= 0.0 else Float32(0.0)
-    params[tid] = p - lr * (g + decay)
+    params[tid] = BFloat16(p - lr * (g + decay))
 
 
 # ── Muon state ───────────────────────────────────────────────────────────────
@@ -254,7 +306,7 @@ struct MuonState:
 
     fn step(
         self, ctx: DeviceContext, idx: Int,
-        params: DeviceBuffer[DType.float32], grads: DeviceBuffer[DType.float32],
+        params: DeviceBuffer[DType.bfloat16], grads: DeviceBuffer[DType.float32],
         lr_multiplier: Float64, momentum: Float64, weight_decay: Float64,
     ) raises:
         var nrows = self.rows[idx]
@@ -288,14 +340,14 @@ struct MuonState:
             # A = X^T@X (tall) or X@X^T (wide)
             if tall:
                 self.temp_a[idx].enqueue_fill(0)
-                ctx.enqueue_function[linear_bwd_dw, linear_bwd_dw](
+                ctx.enqueue_function[linear_bwd_dw_f32, linear_bwd_dw_f32](
                     self.temp_a[idx], self.temp_g[idx], self.temp_g[idx],
                     nrows, ncols, ncols,
                     grid_dim=(ceildiv(ncols, TILE_N), ceildiv(ncols, TILE_M)),
                     block_dim=MM_THREADS,
                 )
             else:
-                ctx.enqueue_function[linear_fwd, linear_fwd](
+                ctx.enqueue_function[linear_fwd_f32, linear_fwd_f32](
                     self.temp_a[idx], self.temp_g[idx], self.temp_g[idx],
                     nrows, nrows, ncols,
                     grid_dim=(ceildiv(nrows, TILE_N), ceildiv(nrows, TILE_M)),
@@ -303,7 +355,7 @@ struct MuonState:
                 )
 
             # B = b*A + c*(A@A)
-            ctx.enqueue_function[linear_bwd_dx, linear_bwd_dx](
+            ctx.enqueue_function[linear_bwd_dx_f32, linear_bwd_dx_f32](
                 self.temp_aa[idx], self.temp_a[idx], self.temp_a[idx],
                 small, small, small,
                 grid_dim=(ceildiv(small, TILE_N), ceildiv(small, TILE_M)),
@@ -317,14 +369,14 @@ struct MuonState:
             # X_new = a*X + X@B (tall) or a*X + B@X (wide)
             # Uses `grads` buffer as scratch (safe: we're done with it)
             if tall:
-                ctx.enqueue_function[linear_bwd_dx, linear_bwd_dx](
+                ctx.enqueue_function[linear_bwd_dx_f32, linear_bwd_dx_f32](
                     grads, self.temp_g[idx], self.temp_b[idx],
                     nrows, ncols, ncols,
                     grid_dim=(ceildiv(ncols, TILE_N), ceildiv(nrows, TILE_M)),
                     block_dim=MM_THREADS,
                 )
             else:
-                ctx.enqueue_function[linear_bwd_dx, linear_bwd_dx](
+                ctx.enqueue_function[linear_bwd_dx_f32, linear_bwd_dx_f32](
                     grads, self.temp_b[idx], self.temp_g[idx],
                     nrows, nrows, ncols,
                     grid_dim=(ceildiv(ncols, TILE_N), ceildiv(nrows, TILE_M)),

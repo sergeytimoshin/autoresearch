@@ -1,1 +1,7 @@
 commit	val_bpb	status	description
+282adf5	2.390422	keep	baseline: depth=8 C=512 B=4 T=512
+3492bcd	2.190782	keep	depth=4 (C=256 2heads): 3.3x more steps
+9c31b6e	2.302352	discard	depth=6: slower than depth=4, worse bpb
+1c80050	2.191871	discard	B=8 depth=4: same tokens, fewer steps, marginally worse
+3d3ff69	2.170718	keep	depth=3 same C=256: 198 steps, new best
+8950aef	2.079178	keep	depth=2 C=128: 514 steps 1M tokens, big improvement

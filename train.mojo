@@ -153,9 +153,12 @@ def main() raises:
     var B = 4
     var T = 512
     var BT = B * T
+    var grad_accum_steps = TOTAL_BATCH_SIZE // BT
+    if grad_accum_steps < 1:
+        grad_accum_steps = 1
 
     print("Model: L=", L, " H=", config.n_head, " C=", C, " V=", V)
-    print("Batch: B=", B, " T=", T, " tokens/step=", BT)
+    print("Batch: B=", B, " T=", T, " micro=", BT, " total=", BT * grad_accum_steps, " accum=", grad_accum_steps)
 
     # ── Model ──
     var weights = ModelWeights(ctx, config)
@@ -231,17 +234,24 @@ def main() raises:
     while True:
         var t0 = perf_counter_ns()
 
-        # Forward + backward
+        # Zero gradients once per optimizer step
         zero_grads(ctx, weights)
         ctx.synchronize()
-        var loss = forward(ctx, weights, bufs, input_buf, target_buf, B, T)
-        backward(ctx, weights, bufs, input_buf, target_buf, B, T, Float32(1.0))
-        ctx.synchronize()
-        var loss_f = Float64(loss)
 
-        # Prefetch next batch
-        epoch = load_batch(ctx, py_loader, input_buf, target_buf, x_host, y_host, BT)
-        ctx.synchronize()
+        # Gradient accumulation: multiple forward+backward micro-batches
+        var acc_loss: Float64 = 0.0
+        var scale = Float32(1.0 / Float64(grad_accum_steps))
+        for _micro in range(grad_accum_steps):
+            var loss = forward(ctx, weights, bufs, input_buf, target_buf, B, T)
+            backward(ctx, weights, bufs, input_buf, target_buf, B, T, scale)
+            ctx.synchronize()
+            acc_loss += Float64(loss) / Float64(grad_accum_steps)
+
+            # Load next micro-batch
+            epoch = load_batch(ctx, py_loader, input_buf, target_buf, x_host, y_host, BT)
+            ctx.synchronize()
+
+        var loss_f = acc_loss
 
         # LR schedule
         var progress = training_time / Float64(time_budget)
@@ -253,15 +263,15 @@ def main() raises:
         opt.step += 1
         opt.step_group(ctx, 0, weights.lm_head, weights.grad_lm_head, lrm)
         opt.step_group(ctx, 1, weights.wte, weights.grad_wte, lrm)
-        opt.step_group(ctx, 2, weights.resid_lambdas, weights.grad_resid_lambdas, lrm)
-        opt.step_group(ctx, 3, weights.x0_lambdas, weights.grad_x0_lambdas, lrm)
+        opt.step_group_f32(ctx, 2, weights.resid_lambdas, weights.grad_resid_lambdas, lrm)
+        opt.step_group_f32(ctx, 3, weights.x0_lambdas, weights.grad_x0_lambdas, lrm)
 
         # AdamW step (VE params)
         var ve_gi = ve_group_start
         for i in range(L):
             if config.has_ve(i):
                 opt.step_group(ctx, ve_gi, weights.value_embeds[i], weights.grad_value_embeds[i], lrm)
-                opt.step_group(ctx, ve_gi + 1, weights.ve_gate[i], weights.grad_ve_gate[i], lrm)
+                opt.step_group_f32(ctx, ve_gi + 1, weights.ve_gate[i], weights.grad_ve_gate[i], lrm)
                 ve_gi += 2
 
         # Muon step (matrix params): momentum ramps 0.85 → 0.95 over first 300 steps
@@ -334,6 +344,6 @@ def main() raises:
     print("training_seconds:", training_time)
     print("total_seconds:   ", total_s)
     print("startup_seconds: ", startup_s)
-    print("total_tokens_M:  ", Float64(step * BT) / 1e6)
+    print("total_tokens_M:  ", Float64(step * BT * grad_accum_steps) / 1e6)
     print("num_steps:       ", step)
     print("depth:           ", DEPTH)

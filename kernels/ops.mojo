@@ -32,13 +32,17 @@ comptime SUB_M: Int = 4
 comptime SUB_N: Int = 4
 comptime MM_THREADS: Int = (TILE_M // SUB_M) * (TILE_N // SUB_N)  # 64
 
+# Flash Attention warp-parallel constants
+comptime FA_WARPS: Int = 4        # warps per thread block
+comptime FA_THREADS: Int = FA_WARPS * 32  # 128 threads per block
+
 
 # ── Embedding ────────────────────────────────────────────────────────────────
 
 
 def embedding_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    weight: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    weight: UnsafePointer[BFloat16, MutAnyOrigin],
     indices: UnsafePointer[Int64, MutAnyOrigin],
     num_tokens: Int,
     embd_dim: Int,
@@ -57,9 +61,9 @@ def embedding_fwd(
 
 
 def rmsnorm_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     rms_out: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     num_rows: Int,
     dim: Int,
 ):
@@ -74,7 +78,7 @@ def rmsnorm_fwd(
     var row_offset = row * dim
     var ss: Float32 = 0.0
     for i in range(Int(tid), dim, Int(THREADS_PER_BLOCK)):
-        var val = input[row_offset + i]
+        var val = Float32(input[row_offset + i])
         ss += val * val
     smem[tid] = ss
     barrier()
@@ -99,13 +103,109 @@ def rmsnorm_fwd(
         rms_out[row] = rms
 
     for i in range(Int(tid), dim, Int(THREADS_PER_BLOCK)):
-        output[row_offset + i] = input[row_offset + i] / rms
+        output[row_offset + i] = BFloat16(Float32(input[row_offset + i]) / rms)
 
 
 # ── Linear (Tiled Matmul) ───────────────────────────────────────────────────
 
 
 def linear_fwd(
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
+    weight: UnsafePointer[BFloat16, MutAnyOrigin],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    """Y[m, n] = sum_k X[m, k] * W[n, k].
+
+    output: [M, N], input: [M, K], weight: [N, K] (row-major).
+    Tiled matmul with shared memory. Load bf16, compute in f32.
+    """
+    var x_smem = stack_allocation[
+        TILE_M * TILE_K, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var w_smem = stack_allocation[
+        TILE_N * TILE_K, Float32, address_space=AddressSpace.SHARED
+    ]()
+
+    var block_m = Int(block_idx.y)
+    var block_n = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+
+    var thread_m = (tid // (TILE_N // SUB_N)) * SUB_M
+    var thread_n = (tid % (TILE_N // SUB_N)) * SUB_N
+
+    var out_m = block_m * TILE_M + thread_m
+    var out_n = block_n * TILE_N + thread_n
+
+    var acc00: Float32 = 0; var acc01: Float32 = 0; var acc02: Float32 = 0; var acc03: Float32 = 0
+    var acc10: Float32 = 0; var acc11: Float32 = 0; var acc12: Float32 = 0; var acc13: Float32 = 0
+    var acc20: Float32 = 0; var acc21: Float32 = 0; var acc22: Float32 = 0; var acc23: Float32 = 0
+    var acc30: Float32 = 0; var acc31: Float32 = 0; var acc32: Float32 = 0; var acc33: Float32 = 0
+
+    var num_k_tiles = (K + TILE_K - 1) // TILE_K
+
+    for k_tile in range(num_k_tiles):
+        var k_base = k_tile * TILE_K
+
+        for load_idx in range(tid, TILE_M * TILE_K, MM_THREADS):
+            var lm = load_idx // TILE_K
+            var lk = load_idx % TILE_K
+            var gm = block_m * TILE_M + lm
+            var gk = k_base + lk
+            if gm < M and gk < K:
+                x_smem[load_idx] = Float32(input[gm * K + gk])
+            else:
+                x_smem[load_idx] = 0.0
+
+        for load_idx in range(tid, TILE_N * TILE_K, MM_THREADS):
+            var ln = load_idx // TILE_K
+            var lk = load_idx % TILE_K
+            var gn = block_n * TILE_N + ln
+            var gk = k_base + lk
+            if gn < N and gk < K:
+                w_smem[load_idx] = Float32(weight[gn * K + gk])
+            else:
+                w_smem[load_idx] = 0.0
+
+        barrier()
+
+        for kk in range(TILE_K):
+            var x0 = x_smem[(thread_m + 0) * TILE_K + kk]
+            var x1 = x_smem[(thread_m + 1) * TILE_K + kk]
+            var x2 = x_smem[(thread_m + 2) * TILE_K + kk]
+            var x3 = x_smem[(thread_m + 3) * TILE_K + kk]
+            var w0 = w_smem[(thread_n + 0) * TILE_K + kk]
+            var w1 = w_smem[(thread_n + 1) * TILE_K + kk]
+            var w2 = w_smem[(thread_n + 2) * TILE_K + kk]
+            var w3 = w_smem[(thread_n + 3) * TILE_K + kk]
+            acc00 += x0 * w0; acc01 += x0 * w1; acc02 += x0 * w2; acc03 += x0 * w3
+            acc10 += x1 * w0; acc11 += x1 * w1; acc12 += x1 * w2; acc13 += x1 * w3
+            acc20 += x2 * w0; acc21 += x2 * w1; acc22 += x2 * w2; acc23 += x2 * w3
+            acc30 += x3 * w0; acc31 += x3 * w1; acc32 += x3 * w2; acc33 += x3 * w3
+
+        barrier()
+
+    if out_m + 0 < M and out_n + 0 < N: output[(out_m + 0) * N + out_n + 0] = BFloat16(acc00)
+    if out_m + 0 < M and out_n + 1 < N: output[(out_m + 0) * N + out_n + 1] = BFloat16(acc01)
+    if out_m + 0 < M and out_n + 2 < N: output[(out_m + 0) * N + out_n + 2] = BFloat16(acc02)
+    if out_m + 0 < M and out_n + 3 < N: output[(out_m + 0) * N + out_n + 3] = BFloat16(acc03)
+    if out_m + 1 < M and out_n + 0 < N: output[(out_m + 1) * N + out_n + 0] = BFloat16(acc10)
+    if out_m + 1 < M and out_n + 1 < N: output[(out_m + 1) * N + out_n + 1] = BFloat16(acc11)
+    if out_m + 1 < M and out_n + 2 < N: output[(out_m + 1) * N + out_n + 2] = BFloat16(acc12)
+    if out_m + 1 < M and out_n + 3 < N: output[(out_m + 1) * N + out_n + 3] = BFloat16(acc13)
+    if out_m + 2 < M and out_n + 0 < N: output[(out_m + 2) * N + out_n + 0] = BFloat16(acc20)
+    if out_m + 2 < M and out_n + 1 < N: output[(out_m + 2) * N + out_n + 1] = BFloat16(acc21)
+    if out_m + 2 < M and out_n + 2 < N: output[(out_m + 2) * N + out_n + 2] = BFloat16(acc22)
+    if out_m + 2 < M and out_n + 3 < N: output[(out_m + 2) * N + out_n + 3] = BFloat16(acc23)
+    if out_m + 3 < M and out_n + 0 < N: output[(out_m + 3) * N + out_n + 0] = BFloat16(acc30)
+    if out_m + 3 < M and out_n + 1 < N: output[(out_m + 3) * N + out_n + 1] = BFloat16(acc31)
+    if out_m + 3 < M and out_n + 2 < N: output[(out_m + 3) * N + out_n + 2] = BFloat16(acc32)
+    if out_m + 3 < M and out_n + 3 < N: output[(out_m + 3) * N + out_n + 3] = BFloat16(acc33)
+
+
+def linear_fwd_f32(
     output: UnsafePointer[Float32, MutAnyOrigin],
     input: UnsafePointer[Float32, MutAnyOrigin],
     weight: UnsafePointer[Float32, MutAnyOrigin],
@@ -115,8 +215,8 @@ def linear_fwd(
 ):
     """Y[m, n] = sum_k X[m, k] * W[n, k].
 
+    Float32 variant for optimizer internal matmuls (Polar Express).
     output: [M, N], input: [M, K], weight: [N, K] (row-major).
-    Tiled matmul with shared memory. Each block computes TILE_M x TILE_N output.
     """
     var x_smem = stack_allocation[
         TILE_M * TILE_K, Float32, address_space=AddressSpace.SHARED
@@ -201,12 +301,140 @@ def linear_fwd(
     if out_m + 3 < M and out_n + 3 < N: output[(out_m + 3) * N + out_n + 3] = acc33
 
 
+def linear_bwd_dx_f32(
+    grad_input: UnsafePointer[Float32, MutAnyOrigin],
+    grad_output: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin],
+    M: Int, N: Int, K: Int,
+):
+    """Float32 variant of linear_bwd_dx for optimizer internals."""
+    var a_smem = stack_allocation[TILE_M * TILE_K, Float32, address_space=AddressSpace.SHARED]()
+    var b_smem = stack_allocation[TILE_K * TILE_N, Float32, address_space=AddressSpace.SHARED]()
+    var block_m = Int(block_idx.y)
+    var block_k = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var thread_m = (tid // (TILE_N // SUB_N)) * SUB_M
+    var thread_k = (tid % (TILE_N // SUB_N)) * SUB_N
+    var out_m = block_m * TILE_M + thread_m
+    var out_k = block_k * TILE_N + thread_k
+    var acc00: Float32 = 0; var acc01: Float32 = 0; var acc02: Float32 = 0; var acc03: Float32 = 0
+    var acc10: Float32 = 0; var acc11: Float32 = 0; var acc12: Float32 = 0; var acc13: Float32 = 0
+    var acc20: Float32 = 0; var acc21: Float32 = 0; var acc22: Float32 = 0; var acc23: Float32 = 0
+    var acc30: Float32 = 0; var acc31: Float32 = 0; var acc32: Float32 = 0; var acc33: Float32 = 0
+    var num_n_tiles = (N + TILE_K - 1) // TILE_K
+    for n_tile in range(num_n_tiles):
+        var n_base = n_tile * TILE_K
+        for li in range(tid, TILE_M * TILE_K, MM_THREADS):
+            var lm = li // TILE_K
+            var ln = li % TILE_K
+            var gm = block_m * TILE_M + lm
+            var gn = n_base + ln
+            a_smem[li] = grad_output[gm * N + gn] if gm < M and gn < N else Float32(0)
+        for li in range(tid, TILE_K * TILE_N, MM_THREADS):
+            var ln = li // TILE_N
+            var lk = li % TILE_N
+            var gn = n_base + ln
+            var gk = block_k * TILE_N + lk
+            b_smem[li] = weight[gn * K + gk] if gn < N and gk < K else Float32(0)
+        barrier()
+        for nn in range(TILE_K):
+            var a0 = a_smem[(thread_m+0)*TILE_K + nn]; var a1 = a_smem[(thread_m+1)*TILE_K + nn]
+            var a2 = a_smem[(thread_m+2)*TILE_K + nn]; var a3 = a_smem[(thread_m+3)*TILE_K + nn]
+            var b0 = b_smem[nn*TILE_N + (thread_k+0)]; var b1 = b_smem[nn*TILE_N + (thread_k+1)]
+            var b2 = b_smem[nn*TILE_N + (thread_k+2)]; var b3 = b_smem[nn*TILE_N + (thread_k+3)]
+            acc00 += a0*b0; acc01 += a0*b1; acc02 += a0*b2; acc03 += a0*b3
+            acc10 += a1*b0; acc11 += a1*b1; acc12 += a1*b2; acc13 += a1*b3
+            acc20 += a2*b0; acc21 += a2*b1; acc22 += a2*b2; acc23 += a2*b3
+            acc30 += a3*b0; acc31 += a3*b1; acc32 += a3*b2; acc33 += a3*b3
+        barrier()
+    if out_m+0 < M and out_k+0 < K: grad_input[(out_m+0)*K + out_k+0] = acc00
+    if out_m+0 < M and out_k+1 < K: grad_input[(out_m+0)*K + out_k+1] = acc01
+    if out_m+0 < M and out_k+2 < K: grad_input[(out_m+0)*K + out_k+2] = acc02
+    if out_m+0 < M and out_k+3 < K: grad_input[(out_m+0)*K + out_k+3] = acc03
+    if out_m+1 < M and out_k+0 < K: grad_input[(out_m+1)*K + out_k+0] = acc10
+    if out_m+1 < M and out_k+1 < K: grad_input[(out_m+1)*K + out_k+1] = acc11
+    if out_m+1 < M and out_k+2 < K: grad_input[(out_m+1)*K + out_k+2] = acc12
+    if out_m+1 < M and out_k+3 < K: grad_input[(out_m+1)*K + out_k+3] = acc13
+    if out_m+2 < M and out_k+0 < K: grad_input[(out_m+2)*K + out_k+0] = acc20
+    if out_m+2 < M and out_k+1 < K: grad_input[(out_m+2)*K + out_k+1] = acc21
+    if out_m+2 < M and out_k+2 < K: grad_input[(out_m+2)*K + out_k+2] = acc22
+    if out_m+2 < M and out_k+3 < K: grad_input[(out_m+2)*K + out_k+3] = acc23
+    if out_m+3 < M and out_k+0 < K: grad_input[(out_m+3)*K + out_k+0] = acc30
+    if out_m+3 < M and out_k+1 < K: grad_input[(out_m+3)*K + out_k+1] = acc31
+    if out_m+3 < M and out_k+2 < K: grad_input[(out_m+3)*K + out_k+2] = acc32
+    if out_m+3 < M and out_k+3 < K: grad_input[(out_m+3)*K + out_k+3] = acc33
+
+
+def linear_bwd_dw_f32(
+    grad_weight: UnsafePointer[Float32, MutAnyOrigin],
+    grad_output: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    M: Int, N: Int, K: Int,
+):
+    """Float32 variant of linear_bwd_dw for optimizer internals."""
+    var a_smem = stack_allocation[TILE_M * TILE_K, Float32, address_space=AddressSpace.SHARED]()
+    var b_smem = stack_allocation[TILE_K * TILE_N, Float32, address_space=AddressSpace.SHARED]()
+    var block_n = Int(block_idx.y)
+    var block_k = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var thread_n = (tid // (TILE_N // SUB_N)) * SUB_M
+    var thread_k = (tid % (TILE_N // SUB_N)) * SUB_N
+    var out_n = block_n * TILE_M + thread_n
+    var out_k = block_k * TILE_N + thread_k
+    var acc00: Float32 = 0; var acc01: Float32 = 0; var acc02: Float32 = 0; var acc03: Float32 = 0
+    var acc10: Float32 = 0; var acc11: Float32 = 0; var acc12: Float32 = 0; var acc13: Float32 = 0
+    var acc20: Float32 = 0; var acc21: Float32 = 0; var acc22: Float32 = 0; var acc23: Float32 = 0
+    var acc30: Float32 = 0; var acc31: Float32 = 0; var acc32: Float32 = 0; var acc33: Float32 = 0
+    var num_m_tiles = (M + TILE_K - 1) // TILE_K
+    for m_tile in range(num_m_tiles):
+        var m_base = m_tile * TILE_K
+        for li in range(tid, TILE_M * TILE_K, MM_THREADS):
+            var ln = li // TILE_K
+            var lm = li % TILE_K
+            var gn = block_n * TILE_M + ln
+            var gm = m_base + lm
+            a_smem[li] = grad_output[gm * N + gn] if gm < M and gn < N else Float32(0)
+        for li in range(tid, TILE_K * TILE_N, MM_THREADS):
+            var lm = li // TILE_N
+            var lk = li % TILE_N
+            var gm = m_base + lm
+            var gk = block_k * TILE_N + lk
+            b_smem[li] = input[gm * K + gk] if gm < M and gk < K else Float32(0)
+        barrier()
+        for mm in range(TILE_K):
+            var a0 = a_smem[(thread_n+0)*TILE_K + mm]; var a1 = a_smem[(thread_n+1)*TILE_K + mm]
+            var a2 = a_smem[(thread_n+2)*TILE_K + mm]; var a3 = a_smem[(thread_n+3)*TILE_K + mm]
+            var b0 = b_smem[mm*TILE_N + (thread_k+0)]; var b1 = b_smem[mm*TILE_N + (thread_k+1)]
+            var b2 = b_smem[mm*TILE_N + (thread_k+2)]; var b3 = b_smem[mm*TILE_N + (thread_k+3)]
+            acc00 += a0*b0; acc01 += a0*b1; acc02 += a0*b2; acc03 += a0*b3
+            acc10 += a1*b0; acc11 += a1*b1; acc12 += a1*b2; acc13 += a1*b3
+            acc20 += a2*b0; acc21 += a2*b1; acc22 += a2*b2; acc23 += a2*b3
+            acc30 += a3*b0; acc31 += a3*b1; acc32 += a3*b2; acc33 += a3*b3
+        barrier()
+    if out_n+0 < N and out_k+0 < K: grad_weight[(out_n+0)*K + out_k+0] += acc00
+    if out_n+0 < N and out_k+1 < K: grad_weight[(out_n+0)*K + out_k+1] += acc01
+    if out_n+0 < N and out_k+2 < K: grad_weight[(out_n+0)*K + out_k+2] += acc02
+    if out_n+0 < N and out_k+3 < K: grad_weight[(out_n+0)*K + out_k+3] += acc03
+    if out_n+1 < N and out_k+0 < K: grad_weight[(out_n+1)*K + out_k+0] += acc10
+    if out_n+1 < N and out_k+1 < K: grad_weight[(out_n+1)*K + out_k+1] += acc11
+    if out_n+1 < N and out_k+2 < K: grad_weight[(out_n+1)*K + out_k+2] += acc12
+    if out_n+1 < N and out_k+3 < K: grad_weight[(out_n+1)*K + out_k+3] += acc13
+    if out_n+2 < N and out_k+0 < K: grad_weight[(out_n+2)*K + out_k+0] += acc20
+    if out_n+2 < N and out_k+1 < K: grad_weight[(out_n+2)*K + out_k+1] += acc21
+    if out_n+2 < N and out_k+2 < K: grad_weight[(out_n+2)*K + out_k+2] += acc22
+    if out_n+2 < N and out_k+3 < K: grad_weight[(out_n+2)*K + out_k+3] += acc23
+    if out_n+3 < N and out_k+0 < K: grad_weight[(out_n+3)*K + out_k+0] += acc30
+    if out_n+3 < N and out_k+1 < K: grad_weight[(out_n+3)*K + out_k+1] += acc31
+    if out_n+3 < N and out_k+2 < K: grad_weight[(out_n+3)*K + out_k+2] += acc32
+    if out_n+3 < N and out_k+3 < K: grad_weight[(out_n+3)*K + out_k+3] += acc33
+
+
 # ── RoPE ─────────────────────────────────────────────────────────────────────
 
 
 def rope_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     cos_buf: UnsafePointer[Float32, MutAnyOrigin],
     sin_buf: UnsafePointer[Float32, MutAnyOrigin],
     num_tokens: Int,
@@ -225,64 +453,74 @@ def rope_fwd(
     var token_idx = token_head_idx // num_heads
 
     var base_offset = token_head_idx * head_dim
-    var x1 = input[base_offset + d]
-    var x2 = input[base_offset + half_dim + d]
+    var x1 = Float32(input[base_offset + d])
+    var x2 = Float32(input[base_offset + half_dim + d])
 
     var cs_offset = token_idx * half_dim + d
     var c = cos_buf[cs_offset]
     var s = sin_buf[cs_offset]
 
-    output[base_offset + d] = x1 * c + x2 * s
-    output[base_offset + half_dim + d] = x1 * (-s) + x2 * c
+    output[base_offset + d] = BFloat16(x1 * c + x2 * s)
+    output[base_offset + half_dim + d] = BFloat16(x1 * (-s) + x2 * c)
 
 
 # ── Flash Attention (Forward) ────────────────────────────────────────────────
 
 
 def flash_attn_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     lse_out: UnsafePointer[Float32, MutAnyOrigin],
-    q: UnsafePointer[Float32, MutAnyOrigin],
-    k: UnsafePointer[Float32, MutAnyOrigin],
-    v: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[BFloat16, MutAnyOrigin],
+    k: UnsafePointer[BFloat16, MutAnyOrigin],
+    v: UnsafePointer[BFloat16, MutAnyOrigin],
     B: Int,
     T: Int,
     num_heads: Int,
     head_dim: Int,
     window_size: Int,
 ):
-    """Flash Attention 2 forward with online softmax, O(T) memory.
+    """Warp-parallel Flash Attention 2 forward with online softmax.
 
-    One thread per (b, qp, h). Each thread loops over all key positions,
-    maintaining running softmax statistics (online softmax algorithm).
+    One warp (32 threads) per query. Each thread handles head_dim/32 elements
+    of the dot product and output, using warp reductions for the full dot.
 
+    Grid: ceil(B*T*H / FA_WARPS),  Block: FA_THREADS (128)
     output: [B*T*num_heads, head_dim]
-    lse_out: [B*T*num_heads] -- log-sum-exp per query (saved for backward)
+    lse_out: [B*T*num_heads]
     q, k, v: [B*T*num_heads, head_dim]
     """
-    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var ws = Int(WARP_SIZE)
+    var lane = Int(thread_idx.x) % ws
+    var warp_id = Int(thread_idx.x) // ws
+    var warps_in_block = Int(block_dim.x) // ws
+    var query_idx = Int(block_idx.x) * warps_in_block + warp_id
     var total = B * T * num_heads
-    if tid >= total or head_dim > 128:
+    if query_idx >= total:
         return
 
-    var bt = tid // num_heads
-    var h = tid % num_heads
+    var bt = query_idx // num_heads
+    var h = query_idx % num_heads
     var b = bt // T
     var qp = bt % T
 
-    var q_base = tid * head_dim
+    var q_base = query_idx * head_dim
     var scale = 1.0 / sqrt(Float32(head_dim))
+    var ept = head_dim // ws  # elements per thread (4 for D=128, W=32)
+    var my_start = lane * ept
 
-    # Online softmax state: running max (m) and running sum-of-exp (l).
-    # As each new key score arrives, rescale the accumulated output so the
-    # softmax normalisation stays correct without materialising the full
-    # T x T attention matrix.
+    # Load Q into registers (bf16 → f32)
+    var q_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        q_reg[e] = Float32(q[q_base + my_start + e])
+
+    # Online softmax state
     var m: Float32 = Float32.MIN
     var l: Float32 = 0.0
 
-    var o_acc = stack_allocation[128, Float32, address_space=AddressSpace.LOCAL]()
-    for d in range(head_dim):
-        o_acc[d] = 0.0
+    # Output accumulator in registers (f32)
+    var o_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        o_reg[e] = 0.0
 
     for kp in range(T):
         if kp > qp:
@@ -291,34 +529,38 @@ def flash_attn_fwd(
             continue
 
         var k_base = (b * T * num_heads + kp * num_heads + h) * head_dim
-        var score: Float32 = 0.0
-        for d in range(head_dim):
-            score += q[q_base + d] * k[k_base + d]
-        score *= scale
 
-        # Online softmax update: adjust running max, rescale old accumulators
+        # Parallel dot product: each thread computes ept partial products
+        var partial: Float32 = 0.0
+        for e in range(ept):
+            partial += q_reg[e] * Float32(k[k_base + my_start + e])
+        var score = warp.sum(partial) * scale
+
+        # Online softmax update
         var m_new = score if score > m else m
         var exp_old = exp(m - m_new)
         var exp_new = exp(score - m_new)
         var l_new = l * exp_old + exp_new
 
-        var alpha = (l * exp_old) / l_new  # rescale factor for old O
-        var beta = exp_new / l_new         # weight for new V
+        var alpha = (l * exp_old) / l_new
+        var beta = exp_new / l_new
         var v_base = (b * T * num_heads + kp * num_heads + h) * head_dim
-        for d in range(head_dim):
-            o_acc[d] = alpha * o_acc[d] + beta * v[v_base + d]
+        for e in range(ept):
+            o_reg[e] = alpha * o_reg[e] + beta * Float32(v[v_base + my_start + e])
 
         m = m_new
         l = l_new
 
-    var out_base = tid * head_dim
-    for d in range(head_dim):
-        output[out_base + d] = o_acc[d]
+    # Store output (f32 → bf16)
+    var out_base = query_idx * head_dim
+    for e in range(ept):
+        output[out_base + my_start + e] = BFloat16(o_reg[e])
 
-    if l > 0.0:
-        lse_out[tid] = m + log(l)
-    else:
-        lse_out[tid] = Float32.MIN
+    if lane == 0:
+        if l > 0.0:
+            lse_out[query_idx] = m + log(l)
+        else:
+            lse_out[query_idx] = Float32.MIN
 
 
 # ── Flash Attention (Backward) ───────────────────────────────────────────────
@@ -326,29 +568,37 @@ def flash_attn_fwd(
 
 def flash_attn_bwd_precompute_d(
     d_out: UnsafePointer[Float32, MutAnyOrigin],
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
     B: Int,
     T: Int,
     num_heads: Int,
     head_dim: Int,
 ):
-    """D[bth] = sum_d O[bth,d] * dO[bth,d]."""
-    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
-    if tid >= B * T * num_heads:
+    """D[bth] = sum_d O[bth,d] * dO[bth,d]. Warp-parallel."""
+    var ws = Int(WARP_SIZE)
+    var lane = Int(thread_idx.x) % ws
+    var warp_id = Int(thread_idx.x) // ws
+    var warps_in_block = Int(block_dim.x) // ws
+    var query_idx = Int(block_idx.x) * warps_in_block + warp_id
+    if query_idx >= B * T * num_heads:
         return
-    var base = tid * head_dim
-    var acc: Float32 = 0.0
-    for d in range(head_dim):
-        acc += output[base + d] * grad_output[base + d]
-    d_out[tid] = acc
+    var base = query_idx * head_dim
+    var ept = head_dim // ws
+    var my_start = lane * ept
+    var partial: Float32 = 0.0
+    for e in range(ept):
+        partial += Float32(output[base + my_start + e]) * grad_output[base + my_start + e]
+    var result = warp.sum(partial)
+    if lane == 0:
+        d_out[query_idx] = result
 
 
 def flash_attn_bwd_dq(
     grad_q: UnsafePointer[Float32, MutAnyOrigin],
-    q: UnsafePointer[Float32, MutAnyOrigin],
-    k: UnsafePointer[Float32, MutAnyOrigin],
-    v: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[BFloat16, MutAnyOrigin],
+    k: UnsafePointer[BFloat16, MutAnyOrigin],
+    v: UnsafePointer[BFloat16, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
     lse: UnsafePointer[Float32, MutAnyOrigin],
     d_buf: UnsafePointer[Float32, MutAnyOrigin],
@@ -358,29 +608,39 @@ def flash_attn_bwd_dq(
     head_dim: Int,
     window_size: Int,
 ):
-    """Compute dQ by recomputing attention weights on the fly.
-
-    dQ[b,qp,h,d] = scale * sum_kp A[qp,kp] * (dA[qp,kp] - D[qp]) * K[kp,d]
-    where A[qp,kp] = exp(Q[qp] . K[kp] * scale - lse[qp]).
-    """
-    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
-    var total = B * T * num_heads * head_dim
-    if tid >= total:
+    """Warp-parallel dQ: one warp per query, recomputing attention on the fly."""
+    var ws = Int(WARP_SIZE)
+    var lane = Int(thread_idx.x) % ws
+    var warp_id = Int(thread_idx.x) // ws
+    var warps_in_block = Int(block_dim.x) // ws
+    var query_idx = Int(block_idx.x) * warps_in_block + warp_id
+    var total = B * T * num_heads
+    if query_idx >= total:
         return
 
-    var bth = tid // head_dim
-    var d = tid % head_dim
-    var bt = bth // num_heads
-    var h = bth % num_heads
+    var bt = query_idx // num_heads
+    var h = query_idx % num_heads
     var b = bt // T
     var qp = bt % T
 
-    var q_base = bth * head_dim
+    var q_base = query_idx * head_dim
     var scale = 1.0 / sqrt(Float32(head_dim))
-    var lse_val = lse[bth]
-    var d_val = d_buf[bth]
+    var lse_val = lse[query_idx]
+    var d_val = d_buf[query_idx]
+    var ept = head_dim // ws
+    var my_start = lane * ept
 
-    var acc: Float32 = 0.0
+    # Load Q and dO into registers
+    var q_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var do_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        q_reg[e] = Float32(q[q_base + my_start + e])
+        do_reg[e] = grad_output[q_base + my_start + e]
+
+    var dq_acc = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        dq_acc[e] = 0.0
+
     for kp in range(T):
         if kp > qp:
             break
@@ -388,33 +648,39 @@ def flash_attn_bwd_dq(
             continue
 
         var k_base = (b * T * num_heads + kp * num_heads + h) * head_dim
+        var v_base = k_base
 
-        var score: Float32 = 0.0
-        for dd in range(head_dim):
-            score += q[q_base + dd] * k[k_base + dd]
-        score *= scale
+        # Recompute Q·K via warp reduction
+        var partial_qk: Float32 = 0.0
+        for e in range(ept):
+            partial_qk += q_reg[e] * Float32(k[k_base + my_start + e])
+        var score = warp.sum(partial_qk) * scale
         var a_val = exp(score - lse_val)
 
-        # dA = sum_dd dO[qp,dd] * V[kp,dd]
-        var v_base = (b * T * num_heads + kp * num_heads + h) * head_dim
-        var do_base = bth * head_dim
-        var da: Float32 = 0.0
-        for dd in range(head_dim):
-            da += grad_output[do_base + dd] * v[v_base + dd]
+        # dA = dO·V via warp reduction
+        var partial_dov: Float32 = 0.0
+        for e in range(ept):
+            partial_dov += do_reg[e] * Float32(v[v_base + my_start + e])
+        var da = warp.sum(partial_dov)
 
         # dS = A * (dA - D)
         var ds = a_val * (da - d_val)
-        acc += ds * k[k_base + d]
 
-    grad_q[tid] = acc * scale
+        # Accumulate dQ (each thread handles its ept elements)
+        for e in range(ept):
+            dq_acc[e] += ds * Float32(k[k_base + my_start + e])
+
+    # Store
+    for e in range(ept):
+        grad_q[q_base + my_start + e] = dq_acc[e] * scale
 
 
 def flash_attn_bwd_dkv(
     grad_k: UnsafePointer[Float32, MutAnyOrigin],
     grad_v: UnsafePointer[Float32, MutAnyOrigin],
-    q: UnsafePointer[Float32, MutAnyOrigin],
-    k: UnsafePointer[Float32, MutAnyOrigin],
-    v: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[BFloat16, MutAnyOrigin],
+    k: UnsafePointer[BFloat16, MutAnyOrigin],
+    v: UnsafePointer[BFloat16, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
     lse: UnsafePointer[Float32, MutAnyOrigin],
     d_buf: UnsafePointer[Float32, MutAnyOrigin],
@@ -424,80 +690,99 @@ def flash_attn_bwd_dkv(
     head_dim: Int,
     window_size: Int,
 ):
-    """Compute dK and dV by looping over query positions, recomputing A on the fly."""
-    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
-    var total = B * T * num_heads * head_dim
-    if tid >= total:
+    """Warp-parallel dK/dV: one warp per key position, recomputing A on the fly."""
+    var ws = Int(WARP_SIZE)
+    var lane = Int(thread_idx.x) % ws
+    var warp_id = Int(thread_idx.x) // ws
+    var warps_in_block = Int(block_dim.x) // ws
+    var key_idx = Int(block_idx.x) * warps_in_block + warp_id
+    var total = B * T * num_heads
+    if key_idx >= total:
         return
 
-    var bth = tid // head_dim
-    var d = tid % head_dim
-    var bt = bth // num_heads
-    var h = bth % num_heads
+    var bt = key_idx // num_heads
+    var h = key_idx % num_heads
     var b = bt // T
     var kp = bt % T
 
-    var k_base = bth * head_dim
+    var k_base = key_idx * head_dim
     var scale = 1.0 / sqrt(Float32(head_dim))
+    var ept = head_dim // ws
+    var my_start = lane * ept
 
-    var dk_acc: Float32 = 0.0
-    var dv_acc: Float32 = 0.0
+    # Load K and V into registers (bf16 → f32)
+    var k_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var v_reg = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        k_reg[e] = Float32(k[k_base + my_start + e])
+        v_reg[e] = Float32(v[k_base + my_start + e])
 
-    # Loop over query positions that attend to this key position:
-    # qp >= kp (causal), qp <= kp + window_size (if windowed)
+    var dk_acc = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var dv_acc = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    for e in range(ept):
+        dk_acc[e] = 0.0
+        dv_acc[e] = 0.0
+
     var qp_start = kp
     var qp_end = T
     if window_size > 0 and kp + window_size < T:
         qp_end = kp + window_size + 1
 
     for qp in range(qp_start, qp_end):
-        var q_base = (b * T * num_heads + qp * num_heads + h) * head_dim
-        var lse_val = lse[b * T * num_heads + qp * num_heads + h]
-        var d_val = d_buf[b * T * num_heads + qp * num_heads + h]
+        var q_idx = b * T * num_heads + qp * num_heads + h
+        var q_base = q_idx * head_dim
+        var lse_val = lse[q_idx]
+        var d_val = d_buf[q_idx]
 
-        var score: Float32 = 0.0
-        for dd in range(head_dim):
-            score += q[q_base + dd] * k[k_base + dd]
-        score *= scale
+        # Q·K via warp reduction
+        var partial_qk: Float32 = 0.0
+        for e in range(ept):
+            partial_qk += k_reg[e] * Float32(q[q_base + my_start + e])
+        var score = warp.sum(partial_qk) * scale
         var a_val = exp(score - lse_val)
 
-        var do_base = (b * T * num_heads + qp * num_heads + h) * head_dim
-        dv_acc += a_val * grad_output[do_base + d]
+        # dV accumulation (each thread handles its ept elements)
+        for e in range(ept):
+            dv_acc[e] += a_val * grad_output[q_base + my_start + e]
 
-        # dA for this (qp, kp)
-        var v_base = bth * head_dim
-        var da: Float32 = 0.0
-        for dd in range(head_dim):
-            da += grad_output[do_base + dd] * v[v_base + dd]
+        # dO·V via warp reduction for dA
+        var partial_dov: Float32 = 0.0
+        for e in range(ept):
+            partial_dov += v_reg[e] * grad_output[q_base + my_start + e]
+        var da = warp.sum(partial_dov)
 
-        # dS = A * (dA - D)
         var ds = a_val * (da - d_val)
-        dk_acc += ds * q[q_base + d]
 
-    grad_k[tid] = dk_acc * scale
-    grad_v[tid] = dv_acc
+        # dK accumulation
+        for e in range(ept):
+            dk_acc[e] += ds * Float32(q[q_base + my_start + e])
+
+    # Store
+    for e in range(ept):
+        grad_k[k_base + my_start + e] = dk_acc[e] * scale
+        grad_v[k_base + my_start + e] = dv_acc[e]
 
 
 # ── Elementwise ──────────────────────────────────────────────────────────────
 
 
 def relu_squared_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     size: Int,
 ):
     """relu(x)^2."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-    var x = input[tid]
+    var x = Float32(input[tid])
     var r = x if x > 0.0 else Float32(0.0)
-    output[tid] = r * r
+    output[tid] = BFloat16(r * r)
 
 
 def softcap_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     cap: Float32,
     size: Int,
 ):
@@ -505,15 +790,15 @@ def softcap_fwd(
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-    output[tid] = cap * tanh(input[tid] / cap)
+    output[tid] = BFloat16(cap * tanh(Float32(input[tid]) / cap))
 
 
 # ── Value Embeddings ─────────────────────────────────────────────────────────
 
 
 def ve_gate_fwd(
-    gate_out: UnsafePointer[Float32, MutAnyOrigin],
-    x_norm: UnsafePointer[Float32, MutAnyOrigin],
+    gate_out: UnsafePointer[BFloat16, MutAnyOrigin],
+    x_norm: UnsafePointer[BFloat16, MutAnyOrigin],
     gate_weight: UnsafePointer[Float32, MutAnyOrigin],
     num_tokens: Int,
     n_kv_head: Int,
@@ -533,16 +818,16 @@ def ve_gate_fwd(
     var h = tid % n_kv_head
     var acc: Float32 = 0.0
     for c in range(gate_channels):
-        acc += gate_weight[h * gate_channels + c] * x_norm[t * embd_dim + c]
+        acc += gate_weight[h * gate_channels + c] * Float32(x_norm[t * embd_dim + c])
     # 2 * sigmoid(x) = 2 / (1 + exp(-x))
     var sig = 1.0 / (1.0 + exp(-acc))
-    gate_out[tid] = 2.0 * sig
+    gate_out[tid] = BFloat16(2.0 * sig)
 
 
 def ve_apply_fwd(
-    v: UnsafePointer[Float32, MutAnyOrigin],
-    gate: UnsafePointer[Float32, MutAnyOrigin],
-    ve: UnsafePointer[Float32, MutAnyOrigin],
+    v: UnsafePointer[BFloat16, MutAnyOrigin],
+    gate: UnsafePointer[BFloat16, MutAnyOrigin],
+    ve: UnsafePointer[BFloat16, MutAnyOrigin],
     num_tokens: Int,
     n_kv_head: Int,
     head_dim: Int,
@@ -554,20 +839,33 @@ def ve_apply_fwd(
         return
     var th = tid // head_dim
     var d = tid % head_dim
-    var g = gate[th]
-    v[tid] += g * ve[tid]
+    var g = Float32(gate[th])
+    v[tid] = BFloat16(Float32(v[tid]) + g * Float32(ve[tid]))
 
 
 # ── Residual Connections ─────────────────────────────────────────────────────
 
 
 def add_residual_fwd(
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    residual: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
+    size: Int,
+):
+    """output = residual + input."""
+    var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if tid >= size:
+        return
+    output[tid] = BFloat16(Float32(residual[tid]) + Float32(input[tid]))
+
+
+def add_residual_fwd_f32(
     output: UnsafePointer[Float32, MutAnyOrigin],
     residual: UnsafePointer[Float32, MutAnyOrigin],
     input: UnsafePointer[Float32, MutAnyOrigin],
     size: Int,
 ):
-    """output = residual + input."""
+    """output = residual + input (float32 variant for gradient accumulation)."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
@@ -575,9 +873,9 @@ def add_residual_fwd(
 
 
 def scaled_add_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    a: UnsafePointer[Float32, MutAnyOrigin],
-    b: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    a: UnsafePointer[BFloat16, MutAnyOrigin],
+    b: UnsafePointer[BFloat16, MutAnyOrigin],
     scale_a: UnsafePointer[Float32, MutAnyOrigin],
     scale_b: UnsafePointer[Float32, MutAnyOrigin],
     idx: Int,
@@ -589,15 +887,15 @@ def scaled_add_fwd(
         return
     var sa = scale_a[idx]
     var sb = scale_b[idx]
-    output[tid] = sa * a[tid] + sb * b[tid]
+    output[tid] = BFloat16(sa * Float32(a[tid]) + sb * Float32(b[tid]))
 
 
 # ── Softmax ──────────────────────────────────────────────────────────────────
 
 
 def softmax_fwd(
-    output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[BFloat16, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     num_rows: Int,
     cols: Int,
 ):
@@ -613,7 +911,7 @@ def softmax_fwd(
     # Max
     var m: Float32 = Float32.MIN
     for i in range(Int(tid), cols, Int(THREADS_PER_BLOCK)):
-        var val = input[row_offset + i]
+        var val = Float32(input[row_offset + i])
         if val > m:
             m = val
     smem[tid] = m
@@ -638,8 +936,8 @@ def softmax_fwd(
     # Exp and sum
     var s: Float32 = 0.0
     for i in range(Int(tid), cols, Int(THREADS_PER_BLOCK)):
-        var val = exp(input[row_offset + i] - row_max)
-        output[row_offset + i] = val
+        var val = exp(Float32(input[row_offset + i]) - row_max)
+        output[row_offset + i] = BFloat16(val)
         s += val
     smem[tid] = s
     barrier()
@@ -661,7 +959,7 @@ def softmax_fwd(
 
     # Normalize
     for i in range(Int(tid), cols, Int(THREADS_PER_BLOCK)):
-        output[row_offset + i] = output[row_offset + i] / row_sum
+        output[row_offset + i] = BFloat16(Float32(output[row_offset + i]) / row_sum)
 
 
 # ── Cross-Entropy ────────────────────────────────────────────────────────────
@@ -669,7 +967,7 @@ def softmax_fwd(
 
 def cross_entropy_fwd(
     loss_out: UnsafePointer[Float32, MutAnyOrigin],
-    logits: UnsafePointer[Float32, MutAnyOrigin],
+    logits: UnsafePointer[BFloat16, MutAnyOrigin],
     targets: UnsafePointer[Int64, MutAnyOrigin],
     num_tokens: Int,
     vocab_size: Int,
@@ -687,7 +985,7 @@ def cross_entropy_fwd(
     # Max
     var m: Float32 = Float32.MIN
     for i in range(Int(tid), vocab_size, Int(THREADS_PER_BLOCK)):
-        var val = logits[row_offset + i]
+        var val = Float32(logits[row_offset + i])
         if val > m:
             m = val
     smem[tid] = m
@@ -712,7 +1010,7 @@ def cross_entropy_fwd(
     # Sum exp
     var s: Float32 = 0.0
     for i in range(Int(tid), vocab_size, Int(THREADS_PER_BLOCK)):
-        s += exp(logits[row_offset + i] - row_max)
+        s += exp(Float32(logits[row_offset + i]) - row_max)
     smem[tid] = s
     barrier()
 
@@ -733,7 +1031,7 @@ def cross_entropy_fwd(
 
     if tid == 0:
         if target >= 0:
-            loss_out[token] = -logits[row_offset + target] + log_sum_exp
+            loss_out[token] = -Float32(logits[row_offset + target]) + log_sum_exp
         else:
             loss_out[token] = 0.0
 
@@ -775,7 +1073,7 @@ def mean_reduce(
 
 def cross_entropy_softcap_bwd(
     grad_logits: UnsafePointer[Float32, MutAnyOrigin],
-    logits: UnsafePointer[Float32, MutAnyOrigin],
+    logits: UnsafePointer[BFloat16, MutAnyOrigin],
     targets: UnsafePointer[Int64, MutAnyOrigin],
     cap: Float32,
     num_tokens: Int,
@@ -807,7 +1105,7 @@ def cross_entropy_softcap_bwd(
     # Max
     var m: Float32 = Float32.MIN
     for i in range(Int(tid), vocab_size, Int(THREADS_PER_BLOCK)):
-        var val = logits[row_offset + i]
+        var val = Float32(logits[row_offset + i])
         if val > m:
             m = val
     smem[tid] = m
@@ -831,7 +1129,7 @@ def cross_entropy_softcap_bwd(
     # Sum exp
     var s: Float32 = 0.0
     for i in range(Int(tid), vocab_size, Int(THREADS_PER_BLOCK)):
-        s += exp(logits[row_offset + i] - row_max)
+        s += exp(Float32(logits[row_offset + i]) - row_max)
     smem[tid] = s
     barrier()
 
@@ -855,7 +1153,7 @@ def cross_entropy_softcap_bwd(
     # would be needed if we wanted gradients w.r.t. pre-cap logits,
     # but for the lm_head backward we need grad w.r.t. capped logits.
     for i in range(Int(tid), vocab_size, Int(THREADS_PER_BLOCK)):
-        var softmax_val = exp(logits[row_offset + i] - row_max) / row_sum
+        var softmax_val = exp(Float32(logits[row_offset + i]) - row_max) / row_sum
         if i == target:
             grad_logits[row_offset + i] = (softmax_val - 1.0) * loss_scale
         else:
@@ -868,7 +1166,7 @@ def cross_entropy_softcap_bwd(
 def linear_bwd_dx(
     grad_input: UnsafePointer[Float32, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
-    weight: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[BFloat16, MutAnyOrigin],
     M: Int,
     N: Int,
     K: Int,
@@ -906,13 +1204,13 @@ def linear_bwd_dx(
             var gn = n_base + ln
             a_smem[li] = grad_output[gm * N + gn] if gm < M and gn < N else Float32(0)
 
-        # Load W[n_chunk, k_range] into b_smem[TILE_K, TILE_N]
+        # Load W[n_chunk, k_range] into b_smem[TILE_K, TILE_N] (bf16 → f32)
         for li in range(tid, TILE_K * TILE_N, MM_THREADS):
             var ln = li // TILE_N
             var lk = li % TILE_N
             var gn = n_base + ln
             var gk = block_k * TILE_N + lk
-            b_smem[li] = weight[gn * K + gk] if gn < N and gk < K else Float32(0)
+            b_smem[li] = Float32(weight[gn * K + gk]) if gn < N and gk < K else Float32(0)
         barrier()
 
         for nn in range(TILE_K):
@@ -951,7 +1249,7 @@ def linear_bwd_dx(
 def linear_bwd_dw(
     grad_weight: UnsafePointer[Float32, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     M: Int,
     N: Int,
     K: Int,
@@ -989,13 +1287,13 @@ def linear_bwd_dw(
             var gm = m_base + lm
             a_smem[li] = grad_output[gm * N + gn] if gm < M and gn < N else Float32(0)
 
-        # Load X[m_chunk, k_range]
+        # Load X[m_chunk, k_range] (bf16 → f32)
         for li in range(tid, TILE_K * TILE_N, MM_THREADS):
             var lm = li // TILE_N
             var lk = li % TILE_N
             var gm = m_base + lm
             var gk = block_k * TILE_N + lk
-            b_smem[li] = input[gm * K + gk] if gm < M and gk < K else Float32(0)
+            b_smem[li] = Float32(input[gm * K + gk]) if gm < M and gk < K else Float32(0)
         barrier()
 
         for mm in range(TILE_K):
@@ -1037,7 +1335,7 @@ def linear_bwd_dw(
 def rmsnorm_bwd(
     grad_input: UnsafePointer[Float32, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     rms_saved: UnsafePointer[Float32, MutAnyOrigin],
     num_rows: Int,
     dim: Int,
@@ -1057,7 +1355,7 @@ def rmsnorm_bwd(
 
     var dot: Float32 = 0.0
     for i in range(Int(tid), dim, Int(THREADS_PER_BLOCK)):
-        dot += grad_output[row_offset + i] * input[row_offset + i]
+        dot += grad_output[row_offset + i] * Float32(input[row_offset + i])
     smem[tid] = dot
     barrier()
 
@@ -1078,7 +1376,7 @@ def rmsnorm_bwd(
     var rms_sq = rms * rms
 
     for i in range(Int(tid), dim, Int(THREADS_PER_BLOCK)):
-        var x = input[row_offset + i]
+        var x = Float32(input[row_offset + i])
         var dy = grad_output[row_offset + i]
         grad_input[row_offset + i] = (dy - x * dot_sum / (Float32(dim) * rms_sq)) / rms
 
@@ -1124,14 +1422,14 @@ def rope_bwd(
 def relu_squared_bwd(
     grad_input: UnsafePointer[Float32, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     size: Int,
 ):
     """d/dx relu(x)^2 = 2*x*dy if x > 0, else 0."""
     var tid = Int(block_idx.x * block_dim.x + thread_idx.x)
     if tid >= size:
         return
-    var x = input[tid]
+    var x = Float32(input[tid])
     if x > 0.0:
         grad_input[tid] = 2.0 * x * grad_output[tid]
     else:
@@ -1192,8 +1490,8 @@ def ve_apply_bwd(
     grad_ve: UnsafePointer[Float32, MutAnyOrigin],
     grad_gate: UnsafePointer[Float32, MutAnyOrigin],
     grad_v: UnsafePointer[Float32, MutAnyOrigin],
-    gate: UnsafePointer[Float32, MutAnyOrigin],
-    ve: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[BFloat16, MutAnyOrigin],
+    ve: UnsafePointer[BFloat16, MutAnyOrigin],
     num_tokens: Int,
     n_kv_head: Int,
     head_dim: Int,
@@ -1212,13 +1510,13 @@ def ve_apply_bwd(
     var tid = thread_idx.x
     var smem = stack_allocation[Int(THREADS_PER_BLOCK), Float32, address_space=AddressSpace.SHARED]()
     var base = row * head_dim
-    var g = gate[row]
+    var g = Float32(gate[row])
 
     var dg: Float32 = 0.0
     for d in range(Int(tid), head_dim, Int(THREADS_PER_BLOCK)):
         var gv = grad_v[base + d]
         grad_ve[base + d] = g * gv
-        dg += ve[base + d] * gv
+        dg += Float32(ve[base + d]) * gv
     smem[tid] = dg
     barrier()
 
@@ -1239,8 +1537,8 @@ def ve_gate_bwd(
     grad_x_norm_out: UnsafePointer[Float32, MutAnyOrigin],
     grad_gate_weight: UnsafePointer[Float32, MutAnyOrigin],
     grad_gate: UnsafePointer[Float32, MutAnyOrigin],
-    gate: UnsafePointer[Float32, MutAnyOrigin],
-    x_norm: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[BFloat16, MutAnyOrigin],
+    x_norm: UnsafePointer[BFloat16, MutAnyOrigin],
     gate_weight: UnsafePointer[Float32, MutAnyOrigin],
     num_tokens: Int,
     n_kv_head: Int,
@@ -1259,12 +1557,12 @@ def ve_gate_bwd(
     var t = tid // n_kv_head
     var h = tid % n_kv_head
 
-    var g = gate[tid]
+    var g = Float32(gate[tid])
     var dz = grad_gate[tid] * g * (1.0 - g / 2.0)
 
     comptime ord = Consistency.RELEASE if is_apple_gpu() else Consistency.SEQUENTIAL
     for c in range(gate_channels):
-        var x_val = x_norm[t * embd_dim + c]
+        var x_val = Float32(x_norm[t * embd_dim + c])
         _ = Atomic.fetch_add[ordering=ord](
             grad_gate_weight + h * gate_channels + c, dz * x_val)
     for c in range(gate_channels):
@@ -1275,7 +1573,7 @@ def ve_gate_bwd(
 def scalar_grad_reduce(
     grad_scalar: UnsafePointer[Float32, MutAnyOrigin],
     grad_output: UnsafePointer[Float32, MutAnyOrigin],
-    input: UnsafePointer[Float32, MutAnyOrigin],
+    input: UnsafePointer[BFloat16, MutAnyOrigin],
     idx: Int,
     size: Int,
 ):
@@ -1288,7 +1586,7 @@ def scalar_grad_reduce(
 
     var s: Float32 = 0.0
     for i in range(Int(tid), size, Int(THREADS_PER_BLOCK)):
-        s += grad_output[i] * input[i]
+        s += grad_output[i] * Float32(input[i])
     smem[tid] = s
     barrier()
 
