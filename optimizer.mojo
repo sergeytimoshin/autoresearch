@@ -218,7 +218,7 @@ def normalize_frobenius_kernel(
     while active > UInt(WARP_SIZE):
         active >>= 1
         if tid < UInt(active):
-            smem[tid] += smem[tid + active]
+            smem[tid] += smem[UInt(tid) + active]
         barrier()
     if tid < UInt(WARP_SIZE):
         var wv: Float32 = smem[tid][0]
@@ -244,6 +244,109 @@ def scale_add_kernel(
     if tid >= size:
         return
     output[tid] = sa * a[tid] + sb * b[tid]
+
+
+def normuon_variance_reduction(
+    g: UnsafePointer[Float32, MutAnyOrigin],
+    second_momentum: UnsafePointer[Float32, MutAnyOrigin],
+    beta2: Float32,
+    nrows: Int, ncols: Int,
+    is_tall: Int,
+):
+    """NorMuon per-row (tall) or per-col (wide) variance reduction. One block.
+
+    For tall matrices (rows >= cols): reduces over cols, scales per row.
+    For wide matrices (rows < cols): reduces over rows, scales per col.
+    """
+    var tid = Int(thread_idx.x)
+    comptime tpb: UInt = 256
+    var smem = stack_allocation[Int(tpb), Float32, address_space=AddressSpace.SHARED]()
+
+    var n_keep = nrows if is_tall == 1 else ncols
+    var n_reduce = ncols if is_tall == 1 else nrows
+
+    # Each thread handles up to 4 elements
+    var v_mean_local = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var sq_sum_local = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var step_local = stack_allocation[4, Float32, address_space=AddressSpace.LOCAL]()
+    var num_my = 0
+
+    # Phase 1: compute per-element variance and accumulate v_norm_sq
+    var my_v_norm_sq: Float32 = 0.0
+    for k in range(tid, n_keep, Int(tpb)):
+        var sq_sum: Float32 = 0.0
+        for j in range(n_reduce):
+            var idx: Int
+            if is_tall == 1:
+                idx = k * ncols + j
+            else:
+                idx = j * ncols + k
+            var val = g[idx]
+            sq_sum += val * val
+        var v_mean = sq_sum / Float32(n_reduce)
+        v_mean_local[num_my] = v_mean
+        sq_sum_local[num_my] = sq_sum
+        my_v_norm_sq += sq_sum
+        num_my += 1
+
+    # Reduce v_norm_sq across threads
+    smem[tid] = my_v_norm_sq
+    barrier()
+    var active = tpb
+    while active > UInt(WARP_SIZE):
+        active >>= 1
+        if tid < Int(active):
+            smem[tid] += smem[UInt(tid) + active]
+        barrier()
+    if tid < Int(WARP_SIZE):
+        var wv: Float32 = smem[tid][0]
+        wv = warp.sum(wv)
+        if tid == 0:
+            smem[0] = wv
+    barrier()
+    var v_norm = sqrt(smem[0][0])
+
+    # Phase 2: update second momentum, compute step_size, accumulate v_norm_new_sq
+    var my_v_norm_new_sq: Float32 = 0.0
+    for i in range(num_my):
+        var k = tid + i * Int(tpb)
+        var sm = second_momentum[k]
+        sm = beta2 * sm + (1.0 - beta2) * v_mean_local[i]
+        second_momentum[k] = sm
+        var clamped = sm if sm > 1e-10 else Float32(1e-10)
+        var ss = 1.0 / sqrt(clamped)
+        step_local[i] = ss
+        my_v_norm_new_sq += sq_sum_local[i] * ss * ss
+
+    # Reduce v_norm_new_sq
+    smem[tid] = my_v_norm_new_sq
+    barrier()
+    active = tpb
+    while active > UInt(WARP_SIZE):
+        active >>= 1
+        if tid < Int(active):
+            smem[tid] += smem[UInt(tid) + active]
+        barrier()
+    if tid < Int(WARP_SIZE):
+        var wv: Float32 = smem[tid][0]
+        wv = warp.sum(wv)
+        if tid == 0:
+            smem[0] = wv
+    barrier()
+    var v_norm_new = sqrt(smem[0][0])
+    var norm_ratio = v_norm / (v_norm_new if v_norm_new > 1e-10 else Float32(1e-10))
+
+    # Phase 3: apply per-element scale
+    for i in range(num_my):
+        var k = tid + i * Int(tpb)
+        var final_scale = step_local[i] * norm_ratio
+        for j in range(n_reduce):
+            var idx: Int
+            if is_tall == 1:
+                idx = k * ncols + j
+            else:
+                idx = j * ncols + k
+            g[idx] = g[idx] * final_scale
 
 
 def muon_update_kernel(
@@ -273,6 +376,7 @@ struct MuonState:
     """
 
     var momentum_bufs: List[DeviceBuffer[DType.float32]]
+    var second_momentum_bufs: List[DeviceBuffer[DType.float32]]  # NorMuon
     var temp_g: List[DeviceBuffer[DType.float32]]
     var temp_a: List[DeviceBuffer[DType.float32]]   # X^T@X or X@X^T
     var temp_b: List[DeviceBuffer[DType.float32]]   # b*A + c*(A@A)
@@ -283,6 +387,7 @@ struct MuonState:
 
     fn __init__(out self, ctx: DeviceContext, initial_lr: Float64) raises:
         self.momentum_bufs = List[DeviceBuffer[DType.float32]]()
+        self.second_momentum_bufs = List[DeviceBuffer[DType.float32]]()
         self.temp_g = List[DeviceBuffer[DType.float32]]()
         self.temp_a = List[DeviceBuffer[DType.float32]]()
         self.temp_b = List[DeviceBuffer[DType.float32]]()
@@ -296,6 +401,11 @@ struct MuonState:
         var mbuf = ctx.enqueue_create_buffer[DType.float32](size)
         mbuf.enqueue_fill(0)
         self.momentum_bufs.append(mbuf)
+        # NorMuon: per-row (tall) or per-col (wide) second momentum
+        var n_keep = nrows if nrows >= ncols else ncols
+        var sm2 = ctx.enqueue_create_buffer[DType.float32](n_keep)
+        sm2.enqueue_fill(0)
+        self.second_momentum_bufs.append(sm2)
         self.temp_g.append(ctx.enqueue_create_buffer[DType.float32](size))
         var small = ncols if nrows >= ncols else nrows
         self.temp_a.append(ctx.enqueue_create_buffer[DType.float32](small * small))
@@ -332,7 +442,7 @@ struct MuonState:
         )
 
         var tall = nrows >= ncols
-        for pe_iter in range(2):
+        for pe_iter in range(5):
             var ca = Float32(POLAR_COEFF_A(pe_iter))
             var cb = Float32(POLAR_COEFF_B(pe_iter))
             var cc = Float32(POLAR_COEFF_C(pe_iter))
@@ -387,7 +497,16 @@ struct MuonState:
                 grid_dim=ceildiv(size, BLOCK), block_dim=BLOCK,
             )
 
-        # 3. Cautious update with weight decay
+        # 3. NorMuon variance reduction
+        ctx.enqueue_function[normuon_variance_reduction, normuon_variance_reduction](
+            self.temp_g[idx], self.second_momentum_bufs[idx],
+            Float32(0.95),  # beta2
+            nrows, ncols,
+            1 if tall else 0,
+            grid_dim=1, block_dim=BLOCK,
+        )
+
+        # 4. Cautious update with weight decay
         ctx.enqueue_function[muon_update_kernel, muon_update_kernel](
             params, self.temp_g[idx], lr, Float32(weight_decay), size,
             grid_dim=ceildiv(size, BLOCK), block_dim=BLOCK,
