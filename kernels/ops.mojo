@@ -522,12 +522,10 @@ def flash_attn_fwd(
     for e in range(ept):
         o_reg[e] = 0.0
 
-    for kp in range(T):
-        if kp > qp:
-            break
-        if window_size > 0 and kp < qp - window_size:
-            continue
-
+    var kp_start = 0
+    if window_size > 0 and qp > window_size:
+        kp_start = qp - window_size
+    for kp in range(kp_start, qp + 1):
         var k_base = (b * T * num_heads + kp * num_heads + h) * head_dim
 
         # Parallel dot product: each thread computes ept partial products
@@ -641,12 +639,10 @@ def flash_attn_bwd_dq(
     for e in range(ept):
         dq_acc[e] = 0.0
 
-    for kp in range(T):
-        if kp > qp:
-            break
-        if window_size > 0 and kp < qp - window_size:
-            continue
-
+    var kp_start_dq = 0
+    if window_size > 0 and qp > window_size:
+        kp_start_dq = qp - window_size
+    for kp in range(kp_start_dq, qp + 1):
         var k_base = (b * T * num_heads + kp * num_heads + h) * head_dim
         var v_base = k_base
 
