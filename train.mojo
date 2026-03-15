@@ -153,7 +153,7 @@ def main() raises:
     var B = 32
     var T = 512
     var BT = B * T
-    var grad_accum_steps = 2
+    var grad_accum_steps = 3
 
     print("Model: L=", L, " H=", config.n_head, " C=", C, " V=", V)
     print("Batch: B=", B, " T=", T, " micro=", BT, " total=", BT * grad_accum_steps, " accum=", grad_accum_steps)
