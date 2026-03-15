@@ -50,7 +50,9 @@ struct GPTConfig(ImplicitlyCopyable, Copyable, Movable):
         return layer_idx % 2 == (self.n_layer - 1) % 2
 
     fn window_size(self, layer_idx: Int) -> Int:
-        """Attention window size: pattern SSSL (S=half, L=full context)."""
+        """Attention window size. Depth=1 uses fixed window for speed."""
+        if self.n_layer == 1:
+            return 512  # O(T*512*D) instead of O(T*T*D) — 4x speedup at T=2048
         if layer_idx == self.n_layer - 1:
             return self.sequence_len
         if layer_idx % 4 < 3:
