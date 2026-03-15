@@ -150,10 +150,10 @@ def main() raises:
     var mlp_dim = MLP_EXPANSION * C
 
     # Training batch dimensions
-    var B = 8
+    var B = 16
     var T = 512
     var BT = B * T
-    var grad_accum_steps = 8
+    var grad_accum_steps = 4
 
     print("Model: L=", L, " H=", config.n_head, " C=", C, " V=", V)
     print("Batch: B=", B, " T=", T, " micro=", BT, " total=", BT * grad_accum_steps, " accum=", grad_accum_steps)
