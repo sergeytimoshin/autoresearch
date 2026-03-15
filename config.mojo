@@ -59,7 +59,7 @@ struct GPTConfig(ImplicitlyCopyable, Copyable, Movable):
 
 comptime MAX_SEQ_LEN: Int = 2048
 comptime TIME_BUDGET: Int = 300     # seconds (5 minutes)
-comptime DEPTH: Int = 3
+comptime DEPTH: Int = 2
 comptime MLP_EXPANSION: Int = 4
 comptime VE_GATE_CHANNELS: Int = 32
 
