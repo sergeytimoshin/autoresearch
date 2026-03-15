@@ -1,23 +1,30 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+
+# Mojo build artifacts
+train
+test_forward
+test_backward
+test_kernels
+test_training
+*.mojopkg
+
+# Pixi
+.pixi/
 
 # Virtual environments
 .venv
 worktrees/
-results/
-queue/
 
-# Agent prompt files (generated per-session by launchers)
+# Agent prompt files
 CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
+# Experimental
 dev/
-
-# Results file
+results/
+queue/
 results.tsv
+run.log
+train_overnight.log
