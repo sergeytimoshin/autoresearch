@@ -43,7 +43,10 @@ struct GPTConfig(ImplicitlyCopyable, Copyable, Movable):
         )
 
     fn has_ve(self, layer_idx: Int) -> Bool:
-        """Whether this layer has a value embedding (alternating, last always on)."""
+        """Whether this layer has a value embedding (alternating, last always on).
+        Disabled for depth=1 (overhead > benefit for single layer)."""
+        if self.n_layer <= 1:
+            return False
         return layer_idx % 2 == (self.n_layer - 1) % 2
 
     fn window_size(self, layer_idx: Int) -> Int:
