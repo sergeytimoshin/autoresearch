@@ -1,0 +1,2 @@
+commit	val_bpb	status	description
+baseline	1.991100	keep	tinygrad depth=4 C=256 B=4 accum=4 first run
